@@ -1,10 +1,12 @@
 // 해정2033 통합 모듈. src/bundle.js 로 두고 사용한다.
 // 합친 파일: lib/collections, lib/firebase, engine/{state,conditions,effects,engine,validate,sample-story},
-//           bot/{commands,discord,verify,render,store,handlers}
-// 다른 코드는 이 파일에서만 import 한다. 예) import { handleInteraction } from '../src/bundle.js';
+//           bot/{commands,discord,verify,render,store,handlers}, web(4단계: 로그인/JWT/스토리 API)
+// 다른 코드는 이 파일에서만 import 한다. 예) import { handleInteraction, createWebRouter } from '../src/bundle.js';
 
 import 'dotenv/config'; // 로컬에서는 .env를 읽고, Vercel에서는 대시보드 환경 변수가 이미 들어 있음
-import { randomUUID, createPublicKey, verify as cryptoVerify } from 'node:crypto';
+import { randomUUID, randomBytes, createHmac, timingSafeEqual, createPublicKey, verify as cryptoVerify } from 'node:crypto';
+import express from 'express';
+import rateLimit from 'express-rate-limit';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 
@@ -1416,4 +1418,1034 @@ async function handleComponent(interaction) {
     default:
       return errorReply('알 수 없는 버튼입니다.');
   }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// web (4단계): 디스코드 OAuth2 로그인, JWT 쿠키, 스토리/장면 CRUD, 입력 검증, 공개 전환, 삭제 정리
+// api/index.js 가 createWebRouter() 를 불러 Express 앱에 붙인다. (함수 개수를 늘리지 않기 위해)
+// 새 패키지는 필요 없다. (JWT, 쿠키 해석은 Node 내장 crypto로 직접 구현)
+// ═════════════════════════════════════════════════════════════════════════
+
+// ═════════════════════════════════════════════
+// 설정값
+// ═════════════════════════════════════════════
+
+export const WEB = {
+  SESSION_COOKIE: 'h2033_session', // 로그인 유지용 JWT 쿠키
+  STATE_COOKIE: 'h2033_state',     // 로그인 도중에만 쓰는 CSRF 방지용 임시 쿠키
+  SESSION_DAYS: 7,                 // 로그인 유지 기간
+  MAX_STORIES_PER_USER: 30,        // 한 사람이 만들 수 있는 스토리 수 (서버 비용 폭주 방지)
+  CSRF_HEADER: 'x-requested-with', // 쓰기 요청에 반드시 붙여야 하는 헤더 이름
+  CSRF_VALUE: 'haejung',           // 위 헤더의 값
+};
+
+// STORY_ID_PATTERN 은 bot/handlers 에서 선언한 것을 그대로 쓴다.
+const KEY_PATTERN = SCENE_ID_PATTERN;             // 스탯/아이템/플래그 키도 장면 키와 같은 규칙
+const DISCORD_ID_PATTERN = /^\d{5,25}$/;
+
+// 입력 제한값 (디스코드 표시 제한과 Firestore 문서 크기를 고려한 값)
+const MAX = {
+  LABEL: 20,        // 스탯/아이템/플래그 이름 (봇이 20자로 자름)
+  STATION: 40,      // 역 이름
+  ENDING_NAME: 50,  // 엔딩 이름
+  IMAGE_URL: 500,   // 이미지 주소
+  ENTRIES: 10,      // 장면 진입 효과 / 선택지 조건 / 선택지 효과 개수
+  BUCKET: 20,       // 스탯, 자원, 파벌 각각의 최대 종류 수
+  DEFS: 50,         // 아이템, 플래그 최대 종류 수
+  NUMBER: 100000,   // 숫자 값의 절대값 상한
+  POSITION: 100000, // 에디터 노드 좌표 상한
+};
+
+// 새 스토리의 기본 설정 (체력 하나만 있는 가장 단순한 상태)
+const DEFAULT_CONFIG = {
+  stats: { hp: { label: '체력', initial: 100, min: 0, max: 100 } },
+};
+
+// DEFAULT_RANGE 는 engine/state 에서 선언한 것을 그대로 쓴다. (min/max 생략 시 엔진과 같은 기본 범위)
+
+const ENTRY_TYPES = ['stat', 'resource', 'faction', 'item', 'flag'];
+const COND_OPS = ['>=', '<=', '>', '<', '==', '!='];
+const ENDING_TYPES = ['good', 'bad', 'hidden'];
+
+// ═════════════════════════════════════════════
+// 작은 도구들: 오류 클래스, 쿠키 해석, 상수 시간 비교
+// ═════════════════════════════════════════════
+
+// 라우트 안에서 throw 하면 wrap()이 알맞은 HTTP 응답으로 바꿔준다.
+export class HttpError extends Error {
+  constructor(status, message, extra = {}) {
+    super(message);
+    this.status = status;
+    this.extra = extra;
+  }
+}
+
+// async 라우트의 오류를 Express로 넘겨주는 감싸개 (Express 4/5 모두 안전)
+const wrap = (fn) => async (req, res, next) => {
+  try {
+    await fn(req, res, next);
+  } catch (err) {
+    if (err instanceof HttpError) {
+      return res.status(err.status).json({ error: err.message, ...err.extra });
+    }
+    next(err);
+  }
+};
+
+/** Cookie 헤더 문자열을 { 이름: 값 } 으로 바꾼다. (cookie-parser 없이 직접 구현) */
+export function parseCookies(header) {
+  const out = Object.create(null); // __proto__ 같은 이름의 쿠키가 와도 안전
+  if (typeof header !== 'string') return out;
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const name = part.slice(0, idx).trim();
+    if (!name || name in out) continue; // 같은 이름이 여러 개면 첫 번째만 사용
+    let value = part.slice(idx + 1).trim();
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      // 해석 실패 시 원문 그대로 사용
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
+// 두 문자열을 같은 시간에 비교 (비교 시간 차이로 값을 추측하는 공격 방지)
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
+// ═════════════════════════════════════════════
+// JWT (HS256): 서명된 로그인 토큰. 서버가 세션을 저장하지 않아도 되는 서버리스용 방식
+// ═════════════════════════════════════════════
+
+function getSecret() {
+  const secret = process.env.JWT_SECRET;
+  if (!secret || secret.length < 32) {
+    throw new Error('JWT_SECRET 환경 변수가 없거나 32자보다 짧습니다. .env를 확인하세요.');
+  }
+  return secret;
+}
+
+const b64url = (text) => Buffer.from(text, 'utf8').toString('base64url');
+
+/** 토큰을 만든다. exp(만료 시각)는 자동으로 넣는다. */
+export function signJwt(payload, ttlSec = WEB.SESSION_DAYS * 86400, now = Date.now()) {
+  const iat = Math.floor(now / 1000);
+  const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body = b64url(JSON.stringify({ ...payload, iat, exp: iat + ttlSec }));
+  const sig = createHmac('sha256', getSecret()).update(`${header}.${body}`).digest('base64url');
+  return `${header}.${body}.${sig}`;
+}
+
+/** 토큰을 검사한다. 올바르면 payload, 아니면(위조/만료/형식 오류) null */
+export function verifyJwt(token, now = Date.now()) {
+  if (typeof token !== 'string' || token.length > 2000) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [header, body, sig] = parts;
+  const secret = getSecret();
+
+  try {
+    // alg가 HS256이 아닌 토큰(예: "none")은 무조건 거절
+    if (JSON.parse(Buffer.from(header, 'base64url').toString('utf8')).alg !== 'HS256') return null;
+
+    const expected = createHmac('sha256', secret).update(`${header}.${body}`).digest();
+    const given = Buffer.from(sig, 'base64url');
+    if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
+
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    if (!Number.isFinite(payload.exp) || payload.exp * 1000 <= now) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// ═════════════════════════════════════════════
+// 입력 검증/정리(sanitize): 서버는 클라이언트를 믿지 않는다.
+// - 모양과 길이를 검사하고, 알려진 필드만 뽑아서 새 객체로 만든다. (모르는 필드는 버림)
+// - 오류는 errors 배열에 한국어 문장으로 모은다. (한 번에 여러 개를 알려주기 위해)
+// - XSS 방지: 서버는 글자를 "그대로" 저장하고, 화면(5단계)에서는 반드시 textContent/React로 출력한다.
+//   (저장할 때 HTML 이스케이프를 하면 이중 변환이 생기므로 출력 쪽에서 막는 것이 원칙)
+// ═════════════════════════════════════════════
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// 제어문자, 글자 방향을 뒤집는 문자(제목 위장에 쓰임), BOM 제거
+const STRIP_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F‎‏‪-‮⁦-⁩﻿]/g;
+
+// 글자 값 정리. 길이를 넘으면 errors에 기록한다.
+function cleanText(value, max, path, errors, { required = false, multiline = false } = {}) {
+  if (value === undefined || value === null) {
+    if (required) errors.push(`${path}: 필수 항목입니다.`);
+    return '';
+  }
+  if (typeof value !== 'string') {
+    errors.push(`${path}: 글자여야 합니다.`);
+    return '';
+  }
+  let text = value.replace(STRIP_CHARS, '').replace(/\r\n?/g, '\n');
+  if (!multiline) text = text.replace(/\n/g, ' '); // 한 줄짜리 항목은 줄바꿈을 공백으로
+  text = text.trim();
+  if (required && !text) errors.push(`${path}: 비어 있을 수 없습니다.`);
+  if (text.length > max) {
+    errors.push(`${path}: ${max}자를 넘을 수 없습니다.`);
+    return text.slice(0, max);
+  }
+  return text;
+}
+
+// 숫자 값 검사 (NaN, Infinity, 문자열 숫자 거절)
+function cleanNumber(value, min, max, path, errors, { int = false } = {}) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    errors.push(`${path}: 숫자여야 합니다.`);
+    return null;
+  }
+  if (int && !Number.isInteger(value)) {
+    errors.push(`${path}: 정수여야 합니다.`);
+    return null;
+  }
+  if (value < min || value > max) {
+    errors.push(`${path}: ${min} ~ ${max} 사이여야 합니다.`);
+    return null;
+  }
+  return value;
+}
+
+// 키(스탯/아이템/플래그/장면 이름)가 안전한 형식인지
+const isValidKey = (key) => typeof key === 'string' && isSafeKey(key) && KEY_PATTERN.test(key);
+
+// 이미지 주소: 비어 있으면 null, 값이 있으면 https만 허용
+function cleanImageUrl(value, path, errors) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string' || value.length > MAX.IMAGE_URL) {
+    errors.push(`${path}: ${MAX.IMAGE_URL}자 이하의 주소여야 합니다.`);
+    return null;
+  }
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== 'https:') throw new Error('not https');
+    if (url.username || url.password) throw new Error('credentials');
+    if (url.href.length > MAX.IMAGE_URL) throw new Error('too long');
+    return url.href;
+  } catch {
+    errors.push(`${path}: https:// 로 시작하는 올바른 주소여야 합니다.`);
+    return null;
+  }
+}
+
+// 배열 정리 도우미: 없으면 빈 배열, 너무 길면 오류
+function cleanList(value, max, path, errors, cleaner) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    errors.push(`${path}: 목록이어야 합니다.`);
+    return [];
+  }
+  if (value.length > max) {
+    errors.push(`${path}: 최대 ${max}개까지 가능합니다.`);
+    return [];
+  }
+  return value.map((item, i) => cleaner(item, `${path}[${i + 1}]`, errors)).filter(Boolean);
+}
+
+// 선택지 조건 1개. 예) { type:'item', key:'gasmask' }, { type:'stat', key:'hp', op:'>=', value:30 }
+function cleanCondition(cond, path, errors) {
+  if (!isPlainObject(cond)) return void errors.push(`${path}: 객체여야 합니다.`);
+  if (!ENTRY_TYPES.includes(cond.type)) return void errors.push(`${path}.type: ${ENTRY_TYPES.join('/')} 중 하나여야 합니다.`);
+  if (!isValidKey(cond.key)) return void errors.push(`${path}.key: 영문/숫자/_/- 40자 이하여야 합니다.`);
+
+  if (cond.type === 'flag') {
+    if (cond.value !== undefined && typeof cond.value !== 'boolean') errors.push(`${path}.value: true/false여야 합니다.`);
+    return { type: 'flag', key: cond.key, value: cond.value !== false };
+  }
+
+  const op = cond.op ?? '>=';
+  if (!COND_OPS.includes(op)) errors.push(`${path}.op: ${COND_OPS.join(' ')} 중 하나여야 합니다.`);
+  // 아이템은 value를 생략하면 "1개 이상"으로 본다 (엔진 규칙과 동일)
+  const raw = cond.type === 'item' && cond.value === undefined ? 1 : cond.value;
+  const value = cleanNumber(raw, -MAX.NUMBER, MAX.NUMBER, `${path}.value`, errors);
+  return { type: cond.type, key: cond.key, op, value };
+}
+
+// 효과 1개. 예) { type:'resource', key:'food', delta:-1 }, { type:'flag', key:'traded', value:true }
+function cleanEffect(effect, path, errors) {
+  if (!isPlainObject(effect)) return void errors.push(`${path}: 객체여야 합니다.`);
+  if (!ENTRY_TYPES.includes(effect.type)) return void errors.push(`${path}.type: ${ENTRY_TYPES.join('/')} 중 하나여야 합니다.`);
+  if (!isValidKey(effect.key)) return void errors.push(`${path}.key: 영문/숫자/_/- 40자 이하여야 합니다.`);
+
+  if (effect.type === 'flag') {
+    if (effect.value !== undefined && typeof effect.value !== 'boolean') errors.push(`${path}.value: true/false여야 합니다.`);
+    return { type: 'flag', key: effect.key, value: effect.value !== false };
+  }
+  const delta = cleanNumber(effect.delta, -MAX.NUMBER, MAX.NUMBER, `${path}.delta`, errors, { int: true });
+  return { type: effect.type, key: effect.key, delta };
+}
+
+/** config(스탯/자원/파벌/아이템/플래그/시작 소지품)를 검증하고 새 객체로 만든다. */
+export function sanitizeConfig(input, errors, path = 'config') {
+  const out = { stats: {}, resources: {}, factions: {}, items: {}, flags: {}, startInventory: {} };
+  if (input === undefined || input === null) return out;
+  if (!isPlainObject(input)) {
+    errors.push(`${path}: 객체여야 합니다.`);
+    return out;
+  }
+
+  // 숫자 항목 (스탯, 자원, 파벌)
+  for (const bucket of ['stats', 'resources', 'factions']) {
+    const source = input[bucket];
+    if (source === undefined || source === null) continue;
+    if (!isPlainObject(source)) {
+      errors.push(`${path}.${bucket}: 객체여야 합니다.`);
+      continue;
+    }
+    const entries = Object.entries(source);
+    if (entries.length > MAX.BUCKET) {
+      errors.push(`${path}.${bucket}: 최대 ${MAX.BUCKET}종류까지 가능합니다.`);
+      continue;
+    }
+    const [defMin, defMax] = DEFAULT_RANGE[bucket];
+
+    for (const [key, def] of entries) {
+      const where = `${path}.${bucket}.${String(key).slice(0, 40)}`;
+      if (!isValidKey(key)) {
+        errors.push(`${where}: 키는 영문/숫자/_/- 40자 이하여야 합니다.`);
+        continue;
+      }
+      if (!isPlainObject(def)) {
+        errors.push(`${where}: 객체여야 합니다.`);
+        continue;
+      }
+      const label = cleanText(def.label ?? key, MAX.LABEL, `${where}.label`, errors, { required: true });
+      const min = def.min === undefined ? defMin : cleanNumber(def.min, -MAX.NUMBER, MAX.NUMBER, `${where}.min`, errors);
+      const max = def.max === undefined ? defMax : cleanNumber(def.max, -MAX.NUMBER, MAX.NUMBER, `${where}.max`, errors);
+      const initial = cleanNumber(def.initial ?? 0, -MAX.NUMBER, MAX.NUMBER, `${where}.initial`, errors);
+
+      if (min !== null && max !== null) {
+        if (min > max) errors.push(`${where}: 최소값이 최대값보다 클 수 없습니다.`);
+        else if (initial !== null && (initial < min || initial > max)) {
+          errors.push(`${where}.initial: 최소~최대 범위 안이어야 합니다.`);
+        }
+      }
+
+      const entry = { label, initial, min, max };
+      // onZero: 이 스탯이 최소값 이하가 되면 이동할 장면 (스탯에만 허용)
+      if (bucket === 'stats' && def.onZero !== undefined && def.onZero !== null && def.onZero !== '') {
+        if (typeof def.onZero === 'string' && SCENE_ID_PATTERN.test(def.onZero)) entry.onZero = def.onZero;
+        else errors.push(`${where}.onZero: 올바른 장면 키여야 합니다.`);
+      }
+      out[bucket][key] = entry;
+    }
+  }
+
+  // 이름만 있는 항목 (아이템, 플래그)
+  for (const bucket of ['items', 'flags']) {
+    const source = input[bucket];
+    if (source === undefined || source === null) continue;
+    if (!isPlainObject(source)) {
+      errors.push(`${path}.${bucket}: 객체여야 합니다.`);
+      continue;
+    }
+    const entries = Object.entries(source);
+    if (entries.length > MAX.DEFS) {
+      errors.push(`${path}.${bucket}: 최대 ${MAX.DEFS}종류까지 가능합니다.`);
+      continue;
+    }
+    for (const [key, def] of entries) {
+      const where = `${path}.${bucket}.${String(key).slice(0, 40)}`;
+      if (!isValidKey(key)) {
+        errors.push(`${where}: 키는 영문/숫자/_/- 40자 이하여야 합니다.`);
+        continue;
+      }
+      const label = cleanText(isPlainObject(def) ? (def.label ?? key) : key, MAX.LABEL, `${where}.label`, errors, { required: true });
+      out[bucket][key] = { label };
+    }
+  }
+
+  // 시작 소지품: 정의된 아이템만, 1~99개
+  const inventory = input.startInventory;
+  if (inventory !== undefined && inventory !== null) {
+    if (!isPlainObject(inventory)) {
+      errors.push(`${path}.startInventory: 객체여야 합니다.`);
+    } else {
+      for (const [key, count] of Object.entries(inventory)) {
+        const where = `${path}.startInventory.${String(key).slice(0, 40)}`;
+        if (!isValidKey(key) || !Object.hasOwn(out.items, key)) {
+          errors.push(`${where}: items에 정의된 아이템이어야 합니다.`);
+          continue;
+        }
+        const n = cleanNumber(count, 1, 99, where, errors, { int: true });
+        if (n !== null) out.startInventory[key] = n;
+      }
+    }
+  }
+  return out;
+}
+
+// 장면 1개 정리
+function sanitizeScene(scene, path, errors) {
+  if (!isPlainObject(scene)) return void errors.push(`${path}: 객체여야 합니다.`);
+
+  if (scene.isEnding !== undefined && typeof scene.isEnding !== 'boolean') errors.push(`${path}.isEnding: true/false여야 합니다.`);
+  const isEnding = scene.isEnding === true;
+
+  const clean = {
+    body: cleanText(scene.body ?? '', LIMITS.SCENE_BODY, `${path}.body`, errors, { multiline: true }),
+    imageUrl: cleanImageUrl(scene.imageUrl, `${path}.imageUrl`, errors),
+    station: cleanText(scene.station ?? '', MAX.STATION, `${path}.station`, errors) || null,
+    isEnding,
+    endingName: null,
+    endingType: null,
+    onEnter: cleanList(scene.onEnter, MAX.ENTRIES, `${path}.onEnter`, errors, cleanEffect),
+    choices: [],
+    posX: 0,
+    posY: 0,
+  };
+
+  // 에디터 노드 위치 (없으면 0)
+  for (const axis of ['posX', 'posY']) {
+    if (scene[axis] !== undefined) {
+      clean[axis] = cleanNumber(scene[axis], -MAX.POSITION, MAX.POSITION, `${path}.${axis}`, errors) ?? 0;
+    }
+  }
+
+  if (isEnding) {
+    // 엔딩 장면: 이름/종류를 저장하고, 선택지는 항상 비운다
+    clean.endingName = cleanText(scene.endingName ?? '', MAX.ENDING_NAME, `${path}.endingName`, errors) || null;
+    if (scene.endingType !== undefined && scene.endingType !== null) {
+      if (ENDING_TYPES.includes(scene.endingType)) clean.endingType = scene.endingType;
+      else errors.push(`${path}.endingType: ${ENDING_TYPES.join('/')} 중 하나여야 합니다.`);
+    }
+    return clean;
+  }
+
+  clean.choices = cleanList(scene.choices, LIMITS.CHOICES_PER_SCENE, `${path}.choices`, errors, (choice, where) => {
+    if (!isPlainObject(choice)) return void errors.push(`${where}: 객체여야 합니다.`);
+    // to는 작성 중에는 비어 있을 수 있다. (끊긴 분기는 공개 전 validateStory가 오류로 잡는다)
+    let to = '';
+    if (choice.to !== undefined && choice.to !== null && choice.to !== '') {
+      if (typeof choice.to === 'string' && SCENE_ID_PATTERN.test(choice.to)) to = choice.to;
+      else errors.push(`${where}.to: 올바른 장면 키여야 합니다.`);
+    }
+    if (choice.hideWhenLocked !== undefined && typeof choice.hideWhenLocked !== 'boolean') {
+      errors.push(`${where}.hideWhenLocked: true/false여야 합니다.`);
+    }
+    return {
+      label: cleanText(choice.label ?? '', LIMITS.CHOICE_LABEL, `${where}.label`, errors),
+      to,
+      condition: cleanList(choice.condition, MAX.ENTRIES, `${where}.condition`, errors, cleanCondition),
+      effects: cleanList(choice.effects, MAX.ENTRIES, `${where}.effects`, errors, cleanEffect),
+      hideWhenLocked: choice.hideWhenLocked === true,
+    };
+  });
+  return clean;
+}
+
+/** scenes 객체 전체({ 장면키: 장면 })를 검증하고 새 객체로 만든다. */
+export function sanitizeScenes(input, errors, path = 'scenes') {
+  const out = {};
+  if (!isPlainObject(input)) {
+    errors.push(`${path}: 객체여야 합니다.`);
+    return out;
+  }
+  const entries = Object.entries(input);
+  if (entries.length === 0) errors.push(`${path}: 장면이 하나 이상 필요합니다.`);
+  if (entries.length > LIMITS.SCENES_PER_STORY) {
+    errors.push(`${path}: 장면은 최대 ${LIMITS.SCENES_PER_STORY}개까지 가능합니다.`);
+    return out;
+  }
+  for (const [key, scene] of entries) {
+    const where = `${path}.${String(key).slice(0, 40)}`;
+    if (!isValidKey(key)) {
+      errors.push(`${where}: 장면 키는 영문/숫자/_/- 40자 이하여야 합니다.`);
+      continue;
+    }
+    const clean = sanitizeScene(scene, where, errors);
+    if (clean) out[key] = clean;
+  }
+  return out;
+}
+
+// 태그 정리: 개수/길이 제한, 중복 제거
+function sanitizeTags(input, errors) {
+  if (input === undefined || input === null) return [];
+  if (!Array.isArray(input)) {
+    errors.push('tags: 목록이어야 합니다.');
+    return [];
+  }
+  if (input.length > LIMITS.TAG_COUNT) errors.push(`tags: 최대 ${LIMITS.TAG_COUNT}개까지 가능합니다.`);
+
+  const seen = new Set();
+  const out = [];
+  for (const raw of input.slice(0, LIMITS.TAG_COUNT)) {
+    const tag = cleanText(raw, LIMITS.TAG_LENGTH, 'tags', errors, { required: true });
+    const lower = tag.toLowerCase();
+    if (tag && !seen.has(lower)) {
+      seen.add(lower);
+      out.push(tag);
+    }
+  }
+  return out;
+}
+
+/** 제목/설명/태그 정리. partial=true 면 "보낸 필드만" 결과에 넣는다. (수정용) */
+export function sanitizeMeta(body, errors, { partial = false } = {}) {
+  const out = {};
+  if (!partial || body.title !== undefined) {
+    out.title = cleanText(body.title, LIMITS.TITLE, 'title', errors, { required: true });
+  }
+  if (!partial || body.description !== undefined) {
+    out.description = cleanText(body.description ?? '', LIMITS.DESCRIPTION, 'description', errors);
+  }
+  if (!partial || body.tags !== undefined) {
+    out.tags = sanitizeTags(body.tags, errors);
+  }
+  return out;
+}
+
+// 장면 맵에 id를 채워서 validateStory 에 넘길 수 있는 모양으로 만든다
+function withIds(scenes) {
+  const out = {};
+  for (const [key, scene] of Object.entries(scenes)) out[key] = { ...scene, id: key };
+  return out;
+}
+
+// ═════════════════════════════════════════════
+// Firestore 도우미
+// ═════════════════════════════════════════════
+
+const storyRef = (id) => getDb().collection(COL.STORIES).doc(id);
+const scenesRef = (id) => storyRef(id).collection(COL.SCENES);
+const plainReader = { get: (ref) => ref.get() }; // 트랜잭션 없이 읽을 때 (tx.get 과 같은 모양)
+
+// 목록/요약에 내려줄 필드만 뽑는다 (config, scenes 제외)
+function summarize(id, data) {
+  return {
+    id,
+    authorId: data.authorId,
+    title: data.title,
+    description: data.description ?? '',
+    tags: Array.isArray(data.tags) ? data.tags : [],
+    isPublic: Boolean(data.isPublic),
+    startSceneId: data.startSceneId ?? null,
+    sceneCount: data.sceneCount ?? 0,
+    playCount: data.playCount ?? 0,
+    likeCount: data.likeCount ?? 0,
+    createdAt: data.createdAt ?? 0,
+    updatedAt: data.updatedAt ?? 0,
+  };
+}
+
+// 장면 스냅샷 → { 장면키: {...장면, id} }
+function scenesFromSnap(snap) {
+  const out = {};
+  for (const doc of snap.docs) out[doc.id] = { ...doc.data(), id: doc.id };
+  return out;
+}
+
+/**
+ * 스토리를 읽고 "내 스토리인지" 확인한다. (읽기 전용. 트랜잭션 안에서도, 밖에서도 사용)
+ * withScenes: 'never' | 'always' | 'ifPublic'
+ * 실패하면 HttpError(404/403)를 던진다.
+ */
+async function readOwned(reader, storyId, userId, { withScenes = 'never' } = {}) {
+  const ref = storyRef(storyId);
+  const snap = await reader.get(ref);
+  if (!snap.exists) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
+  const data = snap.data();
+  if (data.authorId !== userId) {
+    // 비공개 스토리는 존재 자체를 숨기고(404), 공개 스토리는 "권한 없음"(403)
+    throw data.isPublic ? new HttpError(403, '본인이 만든 스토리만 수정할 수 있습니다.') : new HttpError(404, '스토리를 찾을 수 없습니다.');
+  }
+  const story = { ...data, id: snap.id };
+
+  let scenesSnap = null;
+  if (withScenes === 'always' || (withScenes === 'ifPublic' && story.isPublic)) {
+    scenesSnap = await reader.get(scenesRef(storyId));
+  }
+  return {
+    ref,
+    story,
+    scenes: scenesSnap ? scenesFromSnap(scenesSnap) : null,
+    sceneRefs: scenesSnap ? scenesSnap.docs.map((doc) => doc.ref) : [],
+  };
+}
+
+// 에디터가 불러온 시각(baseUpdatedAt)과 저장된 시각이 다르면 "다른 곳에서 먼저 수정됨" 오류
+function checkBaseVersion(baseUpdatedAt, story) {
+  if (baseUpdatedAt !== undefined && baseUpdatedAt !== story.updatedAt) {
+    throw new HttpError(409, '다른 곳에서 먼저 수정되었습니다. 새로고침한 뒤 다시 저장하세요.', {
+      currentUpdatedAt: story.updatedAt,
+    });
+  }
+}
+
+// 입력 오류가 있으면 400으로 응답
+function failIfInvalid(errors) {
+  if (errors.length > 0) throw new HttpError(400, '입력값이 올바르지 않습니다.', { details: errors });
+}
+
+function requireStoryId(req) {
+  const id = req.params.id;
+  if (!STORY_ID_PATTERN.test(id)) throw new HttpError(400, '올바르지 않은 스토리 ID입니다.');
+  return id;
+}
+
+// 스토리 삭제 후 정리: 해당 스토리의 플레이 세션/엔딩 도감을 400개씩 지운다.
+// 서버리스 실행 시간 제한을 고려해 최대 5번(2000개)까지만 처리하고, 남으면 false를 돌려준다.
+async function deleteByStoryId(db, collection, storyId) {
+  const PAGE = 400;
+  for (let page = 0; page < 5; page += 1) {
+    const snap = await db.collection(collection).where('storyId', '==', storyId).limit(PAGE).get();
+    if (snap.empty) return true;
+    const batch = db.batch();
+    snap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+    if (snap.size < PAGE) return true;
+  }
+  return false; // 아직 남았을 수 있음 (7단계 정리 작업에서 처리)
+}
+
+// ═════════════════════════════════════════════
+// 디스코드 OAuth2 도우미
+// ═════════════════════════════════════════════
+
+const siteUrl = () => (process.env.SITE_URL || 'http://localhost:3000').replace(/\/+$/, '');
+const redirectUri = () => `${siteUrl()}/api/auth/callback`;
+
+// 쿠키 공통 옵션: JS에서 못 읽고(httpOnly), 다른 사이트 요청에는 안 붙고(lax), HTTPS에서만 전송(secure)
+const cookieBase = () => ({ httpOnly: true, sameSite: 'lax', secure: siteUrl().startsWith('https://') });
+
+async function discordFetch(url, options) {
+  return fetch(url, { ...options, signal: AbortSignal.timeout(8000) }); // 8초 안에 응답 없으면 포기
+}
+
+// ═════════════════════════════════════════════
+// 라우터
+// ═════════════════════════════════════════════
+
+export function createWebRouter() {
+  const router = express.Router();
+
+  // 로그인 관련 요청은 더 엄격하게 제한 (IP당 1분 20회)
+  const authLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
+  // 쓰기 요청은 "사용자별" 1분 30회 (로그인 후에만 쓰이므로 req.user가 항상 있다)
+  const writeLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => `user:${req.user.id}`,
+  });
+
+  // 모든 API 응답은 캐시하지 않는다 (로그인 상태가 섞이는 것을 방지)
+  router.use('/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
+
+  // CSRF 2차 방어: 글을 바꾸는 요청(POST/PUT/PATCH/DELETE)에는 직접 만든 헤더가 있어야 한다.
+  // 다른 사이트의 폼/이미지는 이 헤더를 붙일 수 없고, fetch로 붙이려면 CORS 사전 확인을 통과해야 하는데
+  // 이 서버는 CORS를 허용하지 않으므로 막힌다. (쿠키의 SameSite=Lax 와 함께 이중 방어)
+  router.use('/api', (req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    if (req.get(WEB.CSRF_HEADER) !== WEB.CSRF_VALUE) {
+      return res.status(403).json({ error: '잘못된 요청입니다.' });
+    }
+    next();
+  });
+
+  // 로그인 쿠키(JWT)를 읽어 req.user 를 채운다. 유효하지 않으면 null
+  function readUser(req) {
+    const token = parseCookies(req.headers.cookie)[WEB.SESSION_COOKIE];
+    const payload = token ? verifyJwt(token) : null;
+    if (!payload || !DISCORD_ID_PATTERN.test(String(payload.sub))) return null;
+    return {
+      id: String(payload.sub),
+      username: String(payload.name ?? '').slice(0, 80),
+      avatar: typeof payload.avatar === 'string' ? payload.avatar : null,
+    };
+  }
+
+  const optionalAuth = (req, res, next) => {
+    req.user = readUser(req);
+    next();
+  };
+
+  const requireAuth = (req, res, next) => {
+    req.user = readUser(req);
+    if (!req.user) return res.status(401).json({ error: '로그인이 필요합니다.' });
+    next();
+  };
+
+  // ───────────── 로그인 / 로그아웃 ─────────────
+
+  // 1) 디스코드 로그인 화면으로 보낸다. state(무작위 값)를 쿠키에도 저장해 두었다가 돌아올 때 대조한다.
+  router.get('/api/auth/login', authLimiter, (req, res) => {
+    const clientId = process.env.DISCORD_APPLICATION_ID;
+    if (!clientId || !process.env.DISCORD_CLIENT_SECRET) {
+      console.error('[auth] DISCORD_APPLICATION_ID 또는 DISCORD_CLIENT_SECRET 환경 변수가 없습니다.');
+      return res.status(500).json({ error: '서버 설정 오류' });
+    }
+    const state = randomBytes(24).toString('hex');
+    res.cookie(WEB.STATE_COOKIE, state, { ...cookieBase(), maxAge: 10 * 60 * 1000, path: '/api/auth' });
+
+    const url = new URL('https://discord.com/oauth2/authorize');
+    url.search = new URLSearchParams({
+      client_id: clientId,
+      response_type: 'code',
+      redirect_uri: redirectUri(),
+      scope: 'identify', // 유저 ID/이름/아바타만 요청 (이메일 등은 요청하지 않음)
+      state,
+      prompt: 'none', // 이미 승인했다면 승인 화면을 건너뜀
+    }).toString();
+    res.redirect(302, url.toString());
+  });
+
+  // 2) 디스코드가 되돌려 보내는 주소: state 검증 → 코드 교환 → 유저 확인 → 내 쿠키 발급
+  router.get(
+    '/api/auth/callback',
+    authLimiter,
+    wrap(async (req, res) => {
+      const { code, state, error } = req.query;
+      const saved = parseCookies(req.headers.cookie)[WEB.STATE_COOKIE];
+      res.clearCookie(WEB.STATE_COOKIE, { ...cookieBase(), path: '/api/auth' }); // state는 한 번만 쓴다
+
+      if (error) return res.redirect(302, '/?login=cancelled'); // 사용자가 취소
+      // state 불일치 = 내가 시작하지 않은 로그인 (CSRF 의심)
+      if (typeof code !== 'string' || typeof state !== 'string' || !saved || !safeEqual(state, saved)) {
+        return res.redirect(302, '/?login=failed');
+      }
+
+      const tokenRes = await discordFetch('https://discord.com/api/v10/oauth2/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: process.env.DISCORD_APPLICATION_ID,
+          client_secret: process.env.DISCORD_CLIENT_SECRET,
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: redirectUri(),
+        }),
+      });
+      if (!tokenRes.ok) {
+        console.error('[auth] 토큰 교환 실패', tokenRes.status); // 응답 본문/비밀 값은 로그에 남기지 않음
+        return res.redirect(302, '/?login=failed');
+      }
+      const token = await tokenRes.json();
+      if (typeof token.access_token !== 'string') return res.redirect(302, '/?login=failed');
+
+      const meRes = await discordFetch('https://discord.com/api/v10/users/@me', {
+        headers: { Authorization: `Bearer ${token.access_token}` },
+      });
+      if (!meRes.ok) return res.redirect(302, '/?login=failed');
+      const me = await meRes.json();
+      if (!DISCORD_ID_PATTERN.test(String(me.id))) return res.redirect(302, '/?login=failed');
+
+      const user = {
+        id: String(me.id),
+        username: String(me.global_name ?? me.username ?? '이름 없음').slice(0, 80),
+        avatar: typeof me.avatar === 'string' ? me.avatar : null,
+      };
+
+      // users/{ID} 저장 (처음이면 createdAt 기록). 디스코드 액세스 토큰은 저장하지 않는다.
+      const userRef = getDb().collection(COL.USERS).doc(user.id);
+      const existing = await userRef.get();
+      const now = Date.now();
+      await userRef.set(
+        { username: user.username, avatar: user.avatar, updatedAt: now, ...(existing.exists ? {} : { createdAt: now }) },
+        { merge: true }
+      );
+
+      const jwt = signJwt({ sub: user.id, name: user.username, avatar: user.avatar });
+      res.cookie(WEB.SESSION_COOKIE, jwt, { ...cookieBase(), maxAge: WEB.SESSION_DAYS * 86400 * 1000, path: '/' });
+      res.redirect(302, '/');
+    })
+  );
+
+  // 지금 로그인한 사람 (로그인 안 했으면 user: null)
+  router.get('/api/auth/me', optionalAuth, (req, res) => {
+    res.json({ user: req.user });
+  });
+
+  // 로그아웃: 쿠키를 지운다. (JWT는 서버에 저장하지 않으므로 만료 전까지 "유효한 토큰"이 남아 있을 수 있다. 7단계에서 보강)
+  router.post('/api/auth/logout', (req, res) => {
+    res.clearCookie(WEB.SESSION_COOKIE, { ...cookieBase(), path: '/' });
+    res.json({ ok: true });
+  });
+
+  // ───────────── 스토리 목록 / 생성 ─────────────
+
+  // 내 스토리 목록 (최신 수정순). 단일 필드 조건이라 복합 인덱스가 필요 없다.
+  router.get(
+    '/api/stories/mine',
+    requireAuth,
+    wrap(async (req, res) => {
+      const snap = await getDb()
+        .collection(COL.STORIES)
+        .where('authorId', '==', req.user.id)
+        .limit(WEB.MAX_STORIES_PER_USER + 20)
+        .get();
+      const stories = snap.docs
+        .map((doc) => summarize(doc.id, doc.data()))
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+      res.json({ stories });
+    })
+  );
+
+  // 새 스토리 만들기: 비공개 + 시작 장면 1개로 시작한다.
+  router.post(
+    '/api/stories',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const body = isPlainObject(req.body) ? req.body : {};
+      const errors = [];
+      const meta = sanitizeMeta(body, errors);
+      const config = sanitizeConfig(body.config ?? DEFAULT_CONFIG, errors);
+      failIfInvalid(errors);
+
+      const db = getDb();
+      const owned = await db
+        .collection(COL.STORIES)
+        .where('authorId', '==', req.user.id)
+        .select() // 문서 내용 없이 개수만 필요
+        .limit(WEB.MAX_STORIES_PER_USER + 1)
+        .get();
+      if (owned.size >= WEB.MAX_STORIES_PER_USER) {
+        throw new HttpError(403, `스토리는 최대 ${WEB.MAX_STORIES_PER_USER}개까지 만들 수 있습니다.`);
+      }
+
+      const id = newStoryId();
+      const now = Date.now();
+      const startScene = {
+        body: '여기에 이야기를 시작하세요.',
+        imageUrl: null,
+        station: null,
+        isEnding: false,
+        endingName: null,
+        endingType: null,
+        onEnter: [],
+        choices: [],
+        posX: 0,
+        posY: 0,
+      };
+      const story = {
+        authorId: req.user.id,
+        title: meta.title,
+        description: meta.description,
+        tags: meta.tags,
+        isPublic: false, // 새 스토리는 항상 비공개 (검증 통과 후 공개)
+        startSceneId: 'start',
+        config,
+        likeCount: 0,
+        playCount: 0,
+        sceneCount: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const batch = db.batch();
+      batch.set(storyRef(id), story);
+      batch.set(scenesRef(id).doc('start'), startScene);
+      await batch.commit();
+
+      res.status(201).json({ story: { ...summarize(id, story), config }, scenes: { start: { ...startScene, id: 'start' } } });
+    })
+  );
+
+  // 저장하지 않은 초안을 검증만 해본다. (에디터의 "유효성 검사" 버튼용. DB는 건드리지 않음)
+  router.post(
+    '/api/validate',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const body = isPlainObject(req.body) ? req.body : {};
+      const errors = [];
+      const config = sanitizeConfig(body.config, errors);
+      const scenes = sanitizeScenes(body.scenes, errors);
+      if (typeof body.startSceneId !== 'string' || !SCENE_ID_PATTERN.test(body.startSceneId)) {
+        errors.push('startSceneId: 올바른 장면 키여야 합니다.');
+      }
+      failIfInvalid(errors);
+      res.json(validateStory({ startSceneId: body.startSceneId, config, scenes: withIds(scenes) }));
+    })
+  );
+
+  // ───────────── 스토리 조회 / 수정 / 삭제 ─────────────
+
+  // 스토리 1개 조회. 제작자 본인은 config와 장면 전체, 다른 사람은 공개 스토리의 요약만 볼 수 있다.
+  router.get(
+    '/api/stories/:id',
+    optionalAuth,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const snap = await storyRef(id).get();
+      if (!snap.exists) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
+      const data = snap.data();
+      const isAuthor = req.user?.id === data.authorId;
+      if (!data.isPublic && !isAuthor) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
+
+      if (!isAuthor) return res.json({ story: summarize(id, data) }); // 스포일러/설정 노출 방지
+
+      const scenes = scenesFromSnap(await scenesRef(id).get());
+      res.json({ story: { ...summarize(id, data), config: data.config ?? {} }, scenes });
+    })
+  );
+
+  // 제목/설명/태그/설정/시작 장면 수정 (보낸 필드만 바꾼다)
+  router.put(
+    '/api/stories/:id',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const body = isPlainObject(req.body) ? req.body : {};
+      const errors = [];
+      const changes = sanitizeMeta(body, errors, { partial: true });
+      if (body.config !== undefined) changes.config = sanitizeConfig(body.config, errors);
+      if (body.startSceneId !== undefined) {
+        if (typeof body.startSceneId === 'string' && SCENE_ID_PATTERN.test(body.startSceneId)) changes.startSceneId = body.startSceneId;
+        else errors.push('startSceneId: 올바른 장면 키여야 합니다.');
+      }
+      failIfInvalid(errors);
+      if (Object.keys(changes).length === 0) throw new HttpError(400, '바꿀 내용이 없습니다.');
+
+      const updatedAt = await getDb().runTransaction(async (tx) => {
+        const { ref, story, scenes } = await readOwned(tx, id, req.user.id, { withScenes: 'ifPublic' });
+        checkBaseVersion(body.baseUpdatedAt, story);
+
+        // 공개 중인 스토리는 항상 "오류 없는 상태"를 유지해야 한다.
+        if (story.isPublic) {
+          const report = validateStory({ ...story, ...changes, scenes });
+          if (!report.ok) {
+            throw new HttpError(422, '공개 중인 스토리는 오류가 없어야 저장할 수 있습니다. 비공개로 바꾼 뒤 수정하세요.', { validation: report });
+          }
+        }
+        const now = Date.now();
+        tx.update(ref, { ...changes, updatedAt: now });
+        return now;
+      });
+      res.json({ ok: true, updatedAt });
+    })
+  );
+
+  // 장면 전체 저장 (에디터의 "저장" 버튼). 보낸 장면 목록이 곧 최종본이다: 없는 장면은 삭제된다.
+  // config, startSceneId 도 함께 보낼 수 있다.
+  router.put(
+    '/api/stories/:id/scenes',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const body = isPlainObject(req.body) ? req.body : {};
+      const errors = [];
+      const scenes = sanitizeScenes(body.scenes, errors);
+      const config = body.config !== undefined ? sanitizeConfig(body.config, errors) : undefined;
+      let startSceneId;
+      if (body.startSceneId !== undefined) {
+        if (typeof body.startSceneId === 'string' && SCENE_ID_PATTERN.test(body.startSceneId)) startSceneId = body.startSceneId;
+        else errors.push('startSceneId: 올바른 장면 키여야 합니다.');
+      }
+      failIfInvalid(errors);
+
+      const result = await getDb().runTransaction(async (tx) => {
+        const { ref, story, sceneRefs } = await readOwned(tx, id, req.user.id, { withScenes: 'always' });
+        checkBaseVersion(body.baseUpdatedAt, story);
+
+        const next = {
+          ...story,
+          config: config ?? story.config,
+          startSceneId: startSceneId ?? story.startSceneId,
+          scenes: withIds(scenes),
+        };
+        const report = validateStory(next);
+        if (story.isPublic && !report.ok) {
+          throw new HttpError(422, '공개 중인 스토리는 오류가 없어야 저장할 수 있습니다. 비공개로 바꾼 뒤 수정하세요.', { validation: report });
+        }
+
+        // 보낸 장면은 통째로 덮어쓰고, 빠진 장면은 지운다. (최대 200 + 200 + 1 = 401건이라 한 번에 가능)
+        for (const [key, scene] of Object.entries(scenes)) tx.set(scenesRef(id).doc(key), scene);
+        for (const oldRef of sceneRefs) {
+          if (!Object.hasOwn(scenes, oldRef.id)) tx.delete(oldRef);
+        }
+        const now = Date.now();
+        tx.update(ref, {
+          sceneCount: Object.keys(scenes).length,
+          startSceneId: next.startSceneId,
+          ...(config ? { config } : {}),
+          updatedAt: now,
+        });
+        return { updatedAt: now, sceneCount: Object.keys(scenes).length, validation: report };
+      });
+      res.json({ ok: true, ...result });
+    })
+  );
+
+  // 이미 저장된 내 스토리를 검사해서 결과(오류/경고)를 돌려준다.
+  router.get(
+    '/api/stories/:id/validate',
+    requireAuth,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const { story, scenes } = await readOwned(plainReader, id, req.user.id, { withScenes: 'always' });
+      res.json(validateStory({ ...story, scenes }));
+    })
+  );
+
+  // 공개/비공개 전환. 공개하려면 validateStory 오류가 0개여야 한다.
+  router.patch(
+    '/api/stories/:id/visibility',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const isPublic = isPlainObject(req.body) ? req.body.isPublic : undefined;
+      if (typeof isPublic !== 'boolean') throw new HttpError(400, 'isPublic은 true/false여야 합니다.');
+
+      const result = await getDb().runTransaction(async (tx) => {
+        const { ref, story, scenes } = await readOwned(tx, id, req.user.id, { withScenes: isPublic ? 'always' : 'never' });
+        let report = null;
+        if (isPublic) {
+          report = validateStory({ ...story, scenes });
+          if (!report.ok) throw new HttpError(422, '오류를 모두 고친 뒤에 공개할 수 있습니다.', { validation: report });
+        }
+        const now = Date.now();
+        tx.update(ref, { isPublic, updatedAt: now });
+        return { isPublic, updatedAt: now, validation: report };
+      });
+      res.json({ ok: true, ...result });
+    })
+  );
+
+  // 삭제 방침:
+  //  1) 스토리 문서와 하위 장면(scenes)을 한 트랜잭션으로 삭제 → 새 플레이 시작이 즉시 막힌다.
+  //  2) 그 스토리의 플레이 세션과 엔딩 도감 기록도 함께 삭제한다. (스토리가 없으면 의미가 없고 개인정보 정리 차원)
+  //  3) 서버리스 시간 제한 때문에 한 번에 2000건까지만 정리한다. 남으면 cleanup:'partial'로 알리고,
+  //     남은 세션은 플레이어가 /포기 로 정리할 수 있다. (일괄 정리는 7단계에서 보강)
+  router.delete(
+    '/api/stories/:id',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const db = getDb();
+
+      await db.runTransaction(async (tx) => {
+        const { ref, sceneRefs } = await readOwned(tx, id, req.user.id, { withScenes: 'always' });
+        sceneRefs.forEach((sceneRef) => tx.delete(sceneRef));
+        tx.delete(ref);
+      });
+
+      const sessionsDone = await deleteByStoryId(db, COL.SESSIONS, id);
+      const endingsDone = await deleteByStoryId(db, COL.ENDINGS, id);
+      res.json({ ok: true, cleanup: sessionsDone && endingsDone ? 'complete' : 'partial' });
+    })
+  );
+
+  return router;
 }

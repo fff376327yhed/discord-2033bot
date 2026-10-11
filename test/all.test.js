@@ -1,7 +1,8 @@
-// 통합 테스트 (엔진 + 메시지 만들기 + 서명 검증). 실행: npm test
-import { test, describe } from 'node:test';
+// 통합 테스트 (엔진 + 메시지 만들기 + 서명 검증 + 4단계 웹 API). 실행: npm test
+import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync, sign } from 'node:crypto';
+import { generateKeyPairSync, sign, createHmac } from 'node:crypto';
+import express from 'express';
 import {
   sampleStory,
   createInitialState,
@@ -12,6 +13,14 @@ import {
   validateStory,
   sceneMessage,
   verifyDiscordSignature,
+  signJwt,
+  verifyJwt,
+  parseCookies,
+  sanitizeConfig,
+  sanitizeScenes,
+  sanitizeMeta,
+  createWebRouter,
+  WEB,
 } from '../src/bundle.js';
 
 const { config } = sampleStory;
@@ -220,5 +229,345 @@ describe('서명 검증', () => {
   test('이상한 서명/키 형식은 오류 없이 거절된다', () => {
     assert.equal(verifyDiscordSignature(body, 'zz', timestamp, publicKeyHex), false);
     assert.equal(verifyDiscordSignature(body, signature, timestamp, 'not-a-key'), false);
+  });
+});
+
+// ═════════════════════════════════════════════
+// 4단계: 웹 API (Firestore에 접속하지 않는다)
+// ═════════════════════════════════════════════
+
+// 테스트용 환경 변수 (.env 값보다 우선)
+process.env.JWT_SECRET = 'test-secret-test-secret-test-secret-1234';
+process.env.DISCORD_APPLICATION_ID = '111111111111111111';
+process.env.DISCORD_CLIENT_SECRET = 'dummy-client-secret';
+process.env.SITE_URL = 'http://localhost:3000';
+
+const USER_ID = '222222222222222222';
+
+// 샘플 스토리 장면에서 id 필드를 뺀 "저장 형식" (Firestore에는 id를 넣지 않는다)
+const sampleScenesInput = () => {
+  const scenes = structuredClone(sampleStory.scenes);
+  for (const scene of Object.values(scenes)) delete scene.id;
+  return scenes;
+};
+
+// ═════════════════════════════════════════════
+// JWT / 쿠키
+// ═════════════════════════════════════════════
+describe('JWT', () => {
+  test('만든 토큰은 검증을 통과하고 내용이 그대로 나온다', () => {
+    const payload = verifyJwt(signJwt({ sub: USER_ID, name: '테스터' }));
+    assert.equal(payload.sub, USER_ID);
+    assert.equal(payload.name, '테스터');
+  });
+
+  test('내용을 바꾸면(위조) 거절된다', () => {
+    const [h, , s] = signJwt({ sub: USER_ID }).split('.');
+    const forged = Buffer.from(JSON.stringify({ sub: '999999999999999999', exp: 9999999999 })).toString('base64url');
+    assert.equal(verifyJwt(`${h}.${forged}.${s}`), null);
+  });
+
+  test('만료된 토큰은 거절된다', () => {
+    const token = signJwt({ sub: USER_ID }, 60, Date.now() - 120_000); // 2분 전에 1분짜리로 발급
+    assert.equal(verifyJwt(token), null);
+  });
+
+  test('alg:none 토큰과 이상한 형식은 거절된다', () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+    const body = Buffer.from(JSON.stringify({ sub: USER_ID, exp: 9999999999 })).toString('base64url');
+    assert.equal(verifyJwt(`${header}.${body}.`), null);
+    assert.equal(verifyJwt('abc'), null);
+    assert.equal(verifyJwt(undefined), null);
+    assert.equal(verifyJwt('a.b.c'), null);
+  });
+
+  test('다른 비밀 값으로 서명한 토큰은 거절된다', () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+    const body = Buffer.from(JSON.stringify({ sub: USER_ID, exp: 9999999999 })).toString('base64url');
+    const sig = createHmac('sha256', 'another-secret-another-secret-123456').update(`${header}.${body}`).digest('base64url');
+    assert.equal(verifyJwt(`${header}.${body}.${sig}`), null);
+  });
+
+  test('JWT_SECRET이 짧으면 서명 자체를 거부한다', () => {
+    const original = process.env.JWT_SECRET;
+    process.env.JWT_SECRET = 'short';
+    assert.throws(() => signJwt({ sub: USER_ID }), /JWT_SECRET/);
+    process.env.JWT_SECRET = original;
+  });
+});
+
+describe('쿠키 해석', () => {
+  test('여러 쿠키를 읽고, 같은 이름은 첫 번째만 쓴다', () => {
+    const cookies = parseCookies('a=1; b=%ED%95%9C; a=2');
+    assert.equal(cookies.a, '1');
+    assert.equal(cookies.b, '한');
+  });
+
+  test('__proto__ 같은 이름이 와도 안전하다', () => {
+    const cookies = parseCookies('__proto__=evil; x=1');
+    assert.equal(Object.getPrototypeOf(cookies), null);
+    assert.equal({}.evil, undefined);
+  });
+
+  test('헤더가 없거나 이상해도 빈 객체', () => {
+    assert.deepEqual({ ...parseCookies(undefined) }, {});
+    assert.deepEqual({ ...parseCookies('이상한값') }, {});
+  });
+});
+
+// ═════════════════════════════════════════════
+// 입력 검증
+// ═════════════════════════════════════════════
+describe('입력 검증: 장면', () => {
+  test('샘플 스토리의 config와 장면은 오류 없이 통과하고 validateStory도 통과한다', () => {
+    const errors = [];
+    const config = sanitizeConfig(sampleStory.config, errors);
+    const scenes = sanitizeScenes(sampleScenesInput(), errors);
+    assert.deepEqual(errors, []);
+
+    const withIds = Object.fromEntries(Object.entries(scenes).map(([k, v]) => [k, { ...v, id: k }]));
+    const report = validateStory({ startSceneId: 'start', config, scenes: withIds });
+    assert.deepEqual(report.errors, []);
+    assert.deepEqual(report.warnings, []);
+  });
+
+  test('알 수 없는 필드는 버려진다', () => {
+    const errors = [];
+    const scenes = sanitizeScenes({ a: { body: 'x', hack: '<script>', choices: [] } }, errors);
+    assert.equal(scenes.a.hack, undefined);
+  });
+
+  test('http/javascript 이미지 주소는 거절된다 (https만 허용)', () => {
+    for (const imageUrl of ['http://example.com/a.png', 'javascript:alert(1)', 'data:text/html,hi', 'https://user:pw@example.com/a.png']) {
+      const errors = [];
+      sanitizeScenes({ a: { body: 'x', imageUrl } }, errors);
+      assert.ok(errors.some((msg) => msg.includes('imageUrl')), imageUrl);
+    }
+    const errors = [];
+    const ok = sanitizeScenes({ a: { body: 'x', imageUrl: 'https://example.com/a.png' } }, errors);
+    assert.deepEqual(errors, []);
+    assert.equal(ok.a.imageUrl, 'https://example.com/a.png');
+  });
+
+  test('장면 키 형식, 위험한 키(__proto__)는 거절된다', () => {
+    const errors = [];
+    sanitizeScenes({ 'bad key': { body: 'x' } }, errors);
+    assert.ok(errors.length > 0);
+
+    const polluted = JSON.parse('{"__proto__": {"body": "x"}, "ok": {"body": "y"}}'); // 자기 속성으로 __proto__ 가 생김
+    const errors2 = [];
+    const out = sanitizeScenes(polluted, errors2);
+    assert.ok(errors2.length > 0);
+    assert.equal(Object.hasOwn(out, '__proto__'), false);
+    assert.equal({}.body, undefined);
+  });
+
+  test('길이 제한: 본문, 버튼 문구, 선택지 개수, 장면 개수', () => {
+    let errors = [];
+    sanitizeScenes({ a: { body: 'ㄱ'.repeat(1801) } }, errors);
+    assert.ok(errors.some((msg) => msg.includes('body')));
+
+    errors = [];
+    sanitizeScenes({ a: { body: 'x', choices: [{ label: 'ㄱ'.repeat(81), to: 'a' }] } }, errors);
+    assert.ok(errors.some((msg) => msg.includes('label')));
+
+    errors = [];
+    const six = Array.from({ length: 6 }, () => ({ label: '선택', to: 'a' }));
+    sanitizeScenes({ a: { body: 'x', choices: six } }, errors);
+    assert.ok(errors.some((msg) => msg.includes('최대 5개')));
+
+    errors = [];
+    const many = Object.fromEntries(Array.from({ length: 201 }, (_, i) => [`s${i}`, { body: 'x' }]));
+    sanitizeScenes(many, errors);
+    assert.ok(errors.some((msg) => msg.includes('최대 200개')));
+  });
+
+  test('조건/효과 형식 검사: 알 수 없는 종류, 잘못된 연산자, 숫자가 아닌 값', () => {
+    const bad = (choice) => {
+      const errors = [];
+      sanitizeScenes({ a: { body: 'x', choices: [{ label: '선택', to: 'a', ...choice }] } }, errors);
+      return errors;
+    };
+    assert.ok(bad({ condition: [{ type: 'magic', key: 'x' }] }).length > 0);
+    assert.ok(bad({ condition: [{ type: 'stat', key: 'hp', op: '=>', value: 1 }] }).length > 0);
+    assert.ok(bad({ condition: [{ type: 'stat', key: 'hp', op: '>=', value: '10' }] }).length > 0);
+    assert.ok(bad({ effects: [{ type: 'stat', key: 'hp', delta: 1.5 }] }).length > 0);
+    assert.ok(bad({ effects: [{ type: 'flag', key: 'f', value: 'yes' }] }).length > 0);
+    assert.ok(bad({ effects: [{ type: 'stat', key: '__proto__', delta: 1 }] }).length > 0);
+    assert.deepEqual(bad({ condition: [{ type: 'item', key: 'gasmask' }], effects: [{ type: 'flag', key: 'f' }] }), []);
+  });
+
+  test('엔딩 장면은 선택지가 비워지고, 엔딩 종류는 good/bad/hidden만 가능', () => {
+    const errors = [];
+    const scenes = sanitizeScenes(
+      { end: { body: 'x', isEnding: true, endingName: '끝', endingType: 'good', choices: [{ label: '무시됨', to: 'end' }] } },
+      errors
+    );
+    assert.deepEqual(errors, []);
+    assert.deepEqual(scenes.end.choices, []);
+
+    const errors2 = [];
+    sanitizeScenes({ end: { body: 'x', isEnding: true, endingType: 'weird' } }, errors2);
+    assert.ok(errors2.some((msg) => msg.includes('endingType')));
+  });
+
+  test('제어문자와 글자 방향 조작 문자는 제거된다', () => {
+    const errors = [];
+    const scenes = sanitizeScenes({ a: { body: 'a\u0000b‮c', station: '역‏' } }, errors);
+    assert.equal(scenes.a.body, 'abc');
+    assert.equal(scenes.a.station, '역');
+  });
+});
+
+describe('입력 검증: config / 메타', () => {
+  test('범위가 뒤집히거나 초기값이 범위 밖이면 오류', () => {
+    let errors = [];
+    sanitizeConfig({ stats: { hp: { label: '체력', initial: 50, min: 100, max: 0 } } }, errors);
+    assert.ok(errors.length > 0);
+
+    errors = [];
+    sanitizeConfig({ stats: { hp: { label: '체력', initial: 500, min: 0, max: 100 } } }, errors);
+    assert.ok(errors.some((msg) => msg.includes('initial')));
+  });
+
+  test('시작 소지품은 정의된 아이템만 가능', () => {
+    const errors = [];
+    sanitizeConfig({ items: { key: { label: '열쇠' } }, startInventory: { key: 1, ghost: 1 } }, errors);
+    assert.equal(errors.length, 1);
+    assert.ok(errors[0].includes('ghost'));
+  });
+
+  test('제목은 필수, 태그는 5개/20자 제한과 중복 제거', () => {
+    let errors = [];
+    sanitizeMeta({ title: '   ' }, errors);
+    assert.ok(errors.some((msg) => msg.includes('title')));
+
+    errors = [];
+    const meta = sanitizeMeta({ title: '제목', tags: ['생존', '생존', 'Metro', 'metro'] }, errors);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(meta.tags, ['생존', 'Metro']);
+
+    errors = [];
+    sanitizeMeta({ title: '제목', tags: ['a', 'b', 'c', 'd', 'e', 'f'] }, errors);
+    assert.ok(errors.some((msg) => msg.includes('최대 5개')));
+
+    errors = [];
+    sanitizeMeta({ title: '제목', tags: ['ㄱ'.repeat(21)] }, errors);
+    assert.ok(errors.some((msg) => msg.includes('20자')));
+  });
+
+  test('수정(partial)은 보낸 필드만 결과에 들어간다', () => {
+    const errors = [];
+    const meta = sanitizeMeta({ title: '새 제목' }, errors, { partial: true });
+    assert.deepEqual(Object.keys(meta), ['title']);
+  });
+});
+
+// ═════════════════════════════════════════════
+// HTTP 흐름 (Firestore 없이 확인 가능한 부분만)
+// ═════════════════════════════════════════════
+describe('로그인과 권한 (HTTP)', () => {
+  let server;
+  let base;
+
+  before(async () => {
+    const app = express();
+    app.use(express.json({ limit: '1mb' }));
+    app.use(createWebRouter());
+    await new Promise((resolve) => {
+      server = app.listen(0, '127.0.0.1', resolve);
+    });
+    base = `http://127.0.0.1:${server.address().port}`;
+  });
+
+  after(() => new Promise((resolve) => server.close(resolve)));
+
+  const loginCookie = () => `${WEB.SESSION_COOKIE}=${signJwt({ sub: USER_ID, name: '테스터', avatar: null })}`;
+  const writeHeaders = (cookie) => ({
+    'Content-Type': 'application/json',
+    [WEB.CSRF_HEADER]: WEB.CSRF_VALUE,
+    ...(cookie ? { Cookie: cookie } : {}),
+  });
+
+  test('/api/auth/login: 디스코드로 보내고, state 쿠키는 httpOnly + SameSite=Lax', async () => {
+    const res = await fetch(`${base}/api/auth/login`, { redirect: 'manual' });
+    assert.equal(res.status, 302);
+
+    const location = new URL(res.headers.get('location'));
+    assert.equal(location.origin + location.pathname, 'https://discord.com/oauth2/authorize');
+    assert.equal(location.searchParams.get('client_id'), process.env.DISCORD_APPLICATION_ID);
+    assert.equal(location.searchParams.get('scope'), 'identify');
+    assert.equal(location.searchParams.get('redirect_uri'), 'http://localhost:3000/api/auth/callback');
+
+    const setCookie = res.headers.getSetCookie().join('\n');
+    assert.ok(setCookie.includes(`${WEB.STATE_COOKIE}=${location.searchParams.get('state')}`));
+    assert.ok(/HttpOnly/i.test(setCookie));
+    assert.ok(/SameSite=Lax/i.test(setCookie));
+  });
+
+  test('/api/auth/callback: state가 맞지 않으면 실패로 돌려보낸다 (CSRF 방어)', async () => {
+    const noCookie = await fetch(`${base}/api/auth/callback?code=abc&state=xyz`, { redirect: 'manual' });
+    assert.equal(noCookie.status, 302);
+    assert.equal(noCookie.headers.get('location'), '/?login=failed');
+
+    const mismatch = await fetch(`${base}/api/auth/callback?code=abc&state=xyz`, {
+      redirect: 'manual',
+      headers: { Cookie: `${WEB.STATE_COOKIE}=other` },
+    });
+    assert.equal(mismatch.headers.get('location'), '/?login=failed');
+  });
+
+  test('/api/auth/me: 쿠키가 올바르면 유저, 없거나 위조면 null', async () => {
+    const ok = await (await fetch(`${base}/api/auth/me`, { headers: { Cookie: loginCookie() } })).json();
+    assert.equal(ok.user.id, USER_ID);
+    assert.equal(ok.user.username, '테스터');
+
+    const none = await (await fetch(`${base}/api/auth/me`)).json();
+    assert.equal(none.user, null);
+
+    const forged = await (await fetch(`${base}/api/auth/me`, { headers: { Cookie: `${WEB.SESSION_COOKIE}=a.b.c` } })).json();
+    assert.equal(forged.user, null);
+  });
+
+  test('쓰기 요청: 보안 헤더가 없으면 403, 로그인이 없으면 401', async () => {
+    const noHeader = await fetch(`${base}/api/stories`, { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } });
+    assert.equal(noHeader.status, 403);
+
+    const noLogin = await fetch(`${base}/api/stories`, { method: 'POST', body: '{}', headers: writeHeaders() });
+    assert.equal(noLogin.status, 401);
+
+    const mine = await fetch(`${base}/api/stories/mine`);
+    assert.equal(mine.status, 401);
+
+    const del = await fetch(`${base}/api/stories/abc`, { method: 'DELETE', headers: writeHeaders() });
+    assert.equal(del.status, 401);
+  });
+
+  test('올바르지 않은 스토리 ID는 DB를 보기 전에 400', async () => {
+    const res = await fetch(`${base}/api/stories/bad%20id/scenes`, {
+      method: 'PUT',
+      headers: writeHeaders(loginCookie()),
+      body: JSON.stringify({ scenes: {} }),
+    });
+    assert.equal(res.status, 400);
+  });
+
+  test('POST /api/validate: 정상 스토리는 통과, 잘못된 입력은 400', async () => {
+    const good = await fetch(`${base}/api/validate`, {
+      method: 'POST',
+      headers: writeHeaders(loginCookie()),
+      body: JSON.stringify({ startSceneId: 'start', config: sampleStory.config, scenes: sampleScenesInput() }),
+    });
+    assert.equal(good.status, 200);
+    const report = await good.json();
+    assert.equal(report.ok, true);
+
+    const bad = await fetch(`${base}/api/validate`, {
+      method: 'POST',
+      headers: writeHeaders(loginCookie()),
+      body: JSON.stringify({ startSceneId: 'start', config: {}, scenes: { start: { body: 'x', imageUrl: 'http://evil.example/a.png' } } }),
+    });
+    assert.equal(bad.status, 400);
+    assert.ok((await bad.json()).details.some((msg) => msg.includes('imageUrl')));
   });
 });
