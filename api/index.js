@@ -3,7 +3,7 @@
 import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { getDb } from '../src/lib/firebase.js';
+import { getDb } from '../src/bundle.js';
 
 const app = express();
 

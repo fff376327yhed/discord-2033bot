@@ -1,8 +1,6 @@
 // Vercel 서버리스 함수: 디스코드가 슬래시 커맨드/버튼 클릭을 이 주소로 보내준다.
 // 주소: https://<내 도메인>/api/interactions  (디스코드 개발자 포털의 Interactions Endpoint URL)
-import { verifyDiscordSignature } from '../src/bot/verify.js';
-import { handleInteraction } from '../src/bot/handlers.js';
-import { InteractionType, errorReply } from '../src/bot/discord.js';
+import { verifyDiscordSignature, handleInteraction, InteractionType, errorReply } from '../src/bundle.js';
 
 // 서명 검증에는 "가공하지 않은 원본 본문"이 필요하므로 자동 JSON 해석을 끈다.
 export const config = { api: { bodyParser: false } };

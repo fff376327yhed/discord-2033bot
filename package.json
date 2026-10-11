@@ -1,5 +1,5 @@
 {
-  "name": "haejung2023",
+  "name": "haejung2033",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -7,13 +7,13 @@
     "node": ">=20"
   },
   "scripts": {
-  "dev": "node scripts/dev-server.js",
-  "check": "node scripts/check-firebase.js",
-  "test": "node --test",
-  "play": "node scripts/play-cli.js",
-  "register": "node scripts/register-commands.js",
-  "seed": "node scripts/seed-sample.js"
-},
+    "dev": "node scripts/cli.js dev",
+    "check": "node scripts/cli.js check",
+    "test": "node --test",
+    "play": "node scripts/cli.js play",
+    "register": "node scripts/cli.js register",
+    "seed": "node scripts/cli.js seed"
+  },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
