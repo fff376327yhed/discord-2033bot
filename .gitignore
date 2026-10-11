@@ -9,3 +9,5 @@ serviceAccount*.json
 dist/
 .DS_Store
 serviceAccount.json
+web/node_modules/
+web/.vite/
