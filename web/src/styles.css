@@ -16,7 +16,7 @@ textarea { resize: vertical; width: 100%; }
 .center-screen { min-height: 100vh; display: grid; place-items: center; }
 .login-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px; }
 
-.topbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
+.topbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
 .topbar .spacer { flex: 1; }
 .topbar .user { color: var(--muted); font-size: 13px; }
 
@@ -25,11 +25,11 @@ textarea { resize: vertical; width: 100%; }
 .story-row .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
 .tag-pill { display: inline-block; background: var(--panel2); border-radius: 999px; padding: 2px 8px; font-size: 11px; margin-right: 4px; }
 
-.editor-layout { display: grid; grid-template-columns: 260px 1fr 360px; height: calc(100vh - 49px); }
+.editor-layout { display: grid; grid-template-columns: 260px 1fr 360px; height: calc(100vh - 49px); height: calc(100dvh - 49px); }
 .editor-col { overflow-y: auto; border-right: 1px solid var(--border); padding: 12px; }
 .editor-col:last-child { border-right: none; }
 
-.scene-node { position: absolute; width: 180px; background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 8px; cursor: grab; user-select: none; font-size: 12px; }
+.scene-node { touch-action: none; /* 손가락으로 끌 때 화면이 같이 밀리지 않게 */ position: absolute; width: 180px; background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 8px; cursor: grab; user-select: none; font-size: 12px; }
 .scene-node.selected { border-color: var(--accent); }
 .scene-node.ending { border-color: var(--good); }
 .scene-node.start-marker { box-shadow: 0 0 0 2px var(--warn); }
@@ -42,6 +42,7 @@ textarea { resize: vertical; width: 100%; }
 .field input, .field textarea, .field select { width: 100%; }
 .row { display: flex; gap: 8px; align-items: center; }
 .row > * { flex: 1; }
+.row > input, .row > select { min-width: 0; }
 
 .list-item { border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px; background: var(--panel2); }
 .list-item .list-item-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
@@ -59,3 +60,70 @@ textarea { resize: vertical; width: 100%; }
 .choice-btn { display: block; width: 100%; text-align: left; margin-top: 6px; }
 .choice-btn.locked { opacity: .5; }
 .badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: var(--panel2); color: var(--muted); }
+
+/* ───────── 6단계 추가: 탭 / 둘러보기 / 아코디언 ───────── */
+.tabs { display: flex; gap: 4px; }
+.tab { background: transparent; color: var(--muted); border: 1px solid transparent; border-radius: 6px; padding: 6px 12px; }
+.tab.active { color: var(--text); border-color: var(--accent); }
+
+.browse-wrap { max-width: 760px; margin: 24px auto; padding: 0 16px; }
+.browse-wrap button { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; }
+.browse-wrap button:disabled { opacity: .5; cursor: not-allowed; }
+.browse-wrap article { background: var(--panel); }
+
+.fold { margin-bottom: 8px; }
+.fold-head { display: flex; align-items: center; gap: 8px; }
+.fold-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; text-align: left; background: transparent; color: var(--text); border: 0; padding: 6px 0; min-height: 36px; }
+.fold-title { font-weight: 600; font-size: 13px; white-space: nowrap; }
+.fold-summary { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.fold-body { padding: 6px 0 2px 4px; }
+
+.entry-row > * { flex: 1 1 90px; min-width: 0; }
+.entry-row > button { flex: 0 0 auto; }
+
+/* ───────── 6단계 추가: 모바일 목록 모드 ───────── */
+.m-editor { padding-bottom: 40px; }
+.m-bar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--border); }
+.m-bar .spacer { flex: 1; }
+.m-title { padding: 12px 12px 4px; font-weight: 700; word-break: break-all; }
+.m-actions { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 12px; }
+.m-actions > * { flex: 1 1 auto; }
+.m-msg { padding: 0 12px 8px; color: var(--muted); font-size: 13px; }
+.m-body { padding: 12px; }
+.m-empty { padding: 24px 12px; color: var(--muted); text-align: center; }
+
+.scene-list { display: grid; gap: 8px; padding: 0 12px 12px; }
+.scene-row { display: block; width: 100%; text-align: left; background: var(--panel); color: var(--text); border: 2px solid var(--border); border-radius: 8px; padding: 10px 12px; min-height: 56px; }
+.scene-row.selected { border-color: var(--accent); }
+.scene-row.ending { border-color: var(--good); }
+.scene-row.start-marker { box-shadow: 0 0 0 2px var(--warn); }
+.scene-row-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.scene-row-title { font-weight: 600; word-break: break-all; }
+.scene-row-badges { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.scene-row-body { margin-top: 4px; color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge.warn { color: var(--warn); }
+
+/* ───────── 6단계 추가: 터치/좁은 화면 ─────────
+   글자 16px 이상: iOS 가 입력칸을 눌렀을 때 화면을 확대하지 않는다.
+   버튼/입력칸 44px 이상: 손가락으로 누르기 편한 크기. 숫자 900 은 Editor.jsx 의 MOBILE_QUERY 와 같다. */
+input, textarea, select { font-size: 16px; }
+
+@media (pointer: coarse), (max-width: 900px) {
+  .btn, .btn-small, .tab, .fold-toggle, .browse-wrap button { min-height: 44px; min-width: 44px; }
+  .btn-small { padding: 6px 12px; font-size: 14px; }
+  input, textarea, select { min-height: 44px; }
+  textarea { min-height: 120px; }
+  input[type='checkbox'] { width: 24px !important; height: 24px; min-height: 24px; flex: 0 0 auto; }
+  .tag-pill { padding: 8px 12px; font-size: 13px; }
+  .story-row { min-height: 56px; }
+}
+
+@media (max-width: 600px) {
+  .topbar { padding: 8px 12px; gap: 8px; }
+  .topbar .tabs { order: 3; width: 100%; }
+  .topbar .tab { flex: 1; }
+  .topbar .user { display: none; }
+  .story-list { margin: 12px auto; }
+  .browse-wrap { margin: 12px auto; }
+  .modal { max-height: 90dvh; padding: 16px; }
+}

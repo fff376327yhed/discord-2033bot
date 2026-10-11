@@ -1,6 +1,31 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from './api.js';
 import { startStory, advance, getAvailableChoices } from './engine.js';
+import useMediaQuery from './useMediaQuery.js';
+
+// 화면이 이 폭 이하이면 "목록 모드"(모바일)로 바꾼다. styles.css 의 @media (max-width: 900px) 와 같은 숫자여야 한다.
+const MOBILE_QUERY = '(max-width: 900px)';
+
+/* ======================================================================
+   Fold — 접었다 펼 수 있는 상자(아코디언). 제목 줄을 누르면 열리고 닫힌다.
+   defaultOpen 은 "처음 나타날 때" 한 번만 읽는다.
+   ====================================================================== */
+function Fold({ title, summary, defaultOpen = false, actions, children }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="fold">
+      <div className="fold-head">
+        <button type="button" className="fold-toggle" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+          <span aria-hidden="true">{open ? '▾' : '▸'}</span>
+          <span className="fold-title">{title}</span>
+          {summary && <span className="fold-summary">{summary}</span>}
+        </button>
+        {actions}
+      </div>
+      {open && <div className="fold-body">{children}</div>}
+    </div>
+  );
+}
 
 /* ======================================================================
    ConfigPanel — 스토리 설정(스탯/자원/파벌/아이템/플래그/시작 소지품)
@@ -170,9 +195,11 @@ function SceneGraph({ scenes, selected, onSelect, startSceneId, onMove, onAddAt 
     function handleUp() { setDragging(null); }
     window.addEventListener('pointermove', handleMove);
     window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleUp); // 터치가 중간에 끊겨도 드래그 해제
     return () => {
       window.removeEventListener('pointermove', handleMove);
       window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleUp);
     };
   }, [dragging, onMove]);
 
@@ -260,7 +287,7 @@ function allKeysOf(config, type) {
 function EntryRow({ entry, config, kind, onChange, onRemove }) {
   const options = allKeysOf(config, entry.type);
   return (
-    <div className="row" style={{ marginBottom: 4, flexWrap: 'wrap' }}>
+    <div className="row entry-row" style={{ marginBottom: 4, flexWrap: 'wrap' }}>
       <select value={entry.type} onChange={(e) => onChange({ ...entry, type: e.target.value, key: '' })}>
         {ENTRY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
       </select>
@@ -296,24 +323,25 @@ function EntryListEditor({ title, list, config, kind, onChange }) {
     onChange([...list, kind === 'condition' ? { type: 'item', key: '', op: '>=', value: 1 } : { type: 'stat', key: '', delta: 0 }]);
   }
   return (
-    <div className="field">
-      <label>{title} ({list.length}/{LIMITS.ENTRIES})</label>
+    <Fold title={title} summary={`${list.length}/${LIMITS.ENTRIES}`}>
       {list.map((entry, i) => (
         <EntryRow key={i} entry={entry} config={config} kind={kind} onChange={(e) => update(i, e)} onRemove={() => remove(i)} />
       ))}
       <button className="btn btn-small" onClick={add}>+ {title} 추가</button>
-    </div>
+    </Fold>
   );
 }
 
-function ChoiceEditor({ choice, index, scenes, config, onChange, onRemove }) {
+function ChoiceEditor({ choice, index, scenes, config, defaultOpen, onChange, onRemove }) {
   const sceneKeys = Object.keys(scenes);
   return (
     <div className="list-item">
-      <div className="list-item-head">
-        <strong style={{ fontSize: 12 }}>선택지 {index + 1}</strong>
-        <button className="btn btn-small btn-danger" onClick={onRemove}>삭제</button>
-      </div>
+      <Fold
+        title={`선택지 ${index + 1}`}
+        summary={`${choice.label || '(문구 없음)'} → ${choice.to || '연결 안 됨'}`}
+        defaultOpen={defaultOpen}
+        actions={<button className="btn btn-small btn-danger" onClick={onRemove}>삭제</button>}
+      >
       <div className="field">
         <label>버튼 문구</label>
         <input value={choice.label} maxLength={LIMITS.LABEL} onChange={(e) => onChange({ ...choice, label: e.target.value })} />
@@ -331,17 +359,20 @@ function ChoiceEditor({ choice, index, scenes, config, onChange, onRemove }) {
         <input type="checkbox" checked={Boolean(choice.hideWhenLocked)} onChange={(e) => onChange({ ...choice, hideWhenLocked: e.target.checked })} style={{ width: 'auto' }} />
         조건 미달 시 선택지를 숨김 (끄면 🔒 잠금 표시로 보여줌)
       </label>
+      </Fold>
     </div>
   );
 }
 
 function SceneForm({ sceneKey, scene, scenes, startSceneId, onChange, onDelete, onSetStart, config }) {
   const choices = scene.choices ?? [];
+  const [newIndex, setNewIndex] = useState(-1); // 방금 추가한 선택지 번호 (그것만 펼쳐서 보여준다)
 
   function updateChoice(i, choice) { const next = [...choices]; next[i] = choice; onChange({ choices: next }); }
   function removeChoice(i) { onChange({ choices: choices.filter((_, idx) => idx !== i) }); }
   function addChoice() {
     if (choices.length >= LIMITS.CHOICES) { alert(`선택지는 최대 ${LIMITS.CHOICES}개까지 가능합니다.`); return; }
+    setNewIndex(choices.length);
     onChange({ choices: [...choices, { label: '선택', to: '', condition: [], effects: [], hideWhenLocked: false }] });
   }
 
@@ -396,7 +427,7 @@ function SceneForm({ sceneKey, scene, scenes, startSceneId, onChange, onDelete, 
             <button className="btn btn-small" onClick={addChoice}>+ 선택지 추가</button>
           </div>
           {choices.map((choice, i) => (
-            <ChoiceEditor key={i} choice={choice} index={i} scenes={scenes} config={config} onChange={(c) => updateChoice(i, c)} onRemove={() => removeChoice(i)} />
+            <ChoiceEditor key={i} choice={choice} index={i} scenes={scenes} config={config} defaultOpen={i === newIndex} onChange={(c) => updateChoice(i, c)} onRemove={() => removeChoice(i)} />
           ))}
         </>
       )}
@@ -545,6 +576,51 @@ function PlayPreview({ config, scenes, startSceneId, storyTitle, onClose }) {
 }
 
 /* ======================================================================
+   SceneList — 모바일용 장면 목록 (그래프 대신). 누르면 편집 화면으로 간다.
+   ====================================================================== */
+
+const ENDING_LABEL = { good: '굿', bad: '배드', hidden: '히든' };
+
+function SceneList({ scenes, startSceneId, selected, onOpen }) {
+  // 그래프에서의 위치(위→아래, 왼쪽→오른쪽) 순서로 보여준다.
+  const entries = Object.entries(scenes).sort(
+    ([, a], [, b]) => (a.posY ?? 0) - (b.posY ?? 0) || (a.posX ?? 0) - (b.posX ?? 0)
+  );
+  if (entries.length === 0) return <div className="m-empty">장면이 없습니다. '+ 장면 추가'를 눌러 만들어 보세요.</div>;
+
+  return (
+    <div className="scene-list">
+      {entries.map(([key, scene]) => {
+        const choices = scene.choices ?? [];
+        const broken = scene.isEnding ? 0 : choices.filter((c) => !c.to || !scenes[c.to]).length;
+        const deadEnd = !scene.isEnding && choices.length === 0;
+        const firstLine = (scene.body ?? '').split('\n')[0];
+        return (
+          <button
+            type="button"
+            key={key}
+            className={`scene-row ${selected === key ? 'selected' : ''} ${scene.isEnding ? 'ending' : ''} ${key === startSceneId ? 'start-marker' : ''}`}
+            onClick={() => onOpen(key)}
+          >
+            <div className="scene-row-head">
+              <span className="scene-row-title">{key === startSceneId ? '🚩 ' : ''}{scene.isEnding ? '🏁 ' : ''}{key}</span>
+              <span className="scene-row-badges">
+                {scene.isEnding
+                  ? <span className="badge">엔딩{scene.endingType ? ` · ${ENDING_LABEL[scene.endingType] ?? ''}` : ''}</span>
+                  : <span className="badge">선택지 {choices.length}</span>}
+                {broken > 0 && <span className="badge warn">끊김 {broken}</span>}
+                {deadEnd && <span className="badge warn">막다른 길</span>}
+              </span>
+            </div>
+            <div className="scene-row-body">{firstLine || '(본문 없음)'}</div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ======================================================================
    Editor — 전체 레이아웃 (위 패널들을 조합)
    ====================================================================== */
 
@@ -572,6 +648,13 @@ export default function Editor({ storyId, onBack }) {
   const [saveMsg, setSaveMsg] = useState(null);
   const [validation, setValidation] = useState(null);
   const [preview, setPreview] = useState(false);
+  const isMobile = useMediaQuery(MOBILE_QUERY);
+  const [mobileView, setMobileView] = useState('list'); // 모바일 화면: 'list'(장면 목록) | 'edit'(장면 편집) | 'settings'(스토리 설정)
+  // 선택된 장면이 없어졌는데 편집 화면이면 목록으로 돌려보낸다.
+  const view = mobileView === 'edit' && !(selected && scenes[selected]) ? 'list' : mobileView;
+
+  // 모바일에서 화면이 바뀌면 맨 위로 올린다.
+  useEffect(() => { window.scrollTo(0, 0); }, [view, isMobile]);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -604,6 +687,13 @@ export default function Editor({ storyId, onBack }) {
     };
     setScenes((prev) => ({ ...prev, [key]: scene }));
     setSelected(key);
+    setMobileView('edit'); // 모바일에서는 바로 편집 화면으로 (데스크톱에서는 쓰이지 않는다)
+  }
+
+  // 모바일에서 장면을 추가할 때는 겹치지 않게 격자 위치에 놓는다.
+  function addSceneMobile() {
+    const n = Object.keys(scenes).length;
+    addScene((n % 4) * 260, Math.floor(n / 4) * 180);
   }
 
   function deleteScene(key) {
@@ -618,6 +708,7 @@ export default function Editor({ storyId, onBack }) {
       return next;
     });
     setSelected((cur) => (cur === key ? null : cur));
+    setMobileView('list'); // 모바일: 삭제 후 목록으로
   }
 
   async function handleSave() {
@@ -669,6 +760,80 @@ export default function Editor({ storyId, onBack }) {
   if (loading) return <div style={{ padding: 20 }}>불러오는 중...</div>;
   if (error) return <div style={{ padding: 20 }}>⚠️ {error}</div>;
 
+  // ───────────── 모바일(좁은 화면): 목록 모드 ─────────────
+  if (isMobile) {
+    const saveButton = (
+      <button className="btn btn-primary" disabled={saving} onClick={handleSave}>{saving ? '저장 중...' : '저장'}</button>
+    );
+    return (
+      <div className="m-editor">
+        {view === 'list' && (
+          <>
+            <div className="m-bar">
+              <button className="btn" onClick={onBack}>← 내 스토리</button>
+              <div className="spacer" />
+              <button className="btn" onClick={() => setMobileView('settings')}>⚙ 설정</button>
+            </div>
+            <div className="m-title">
+              {meta.title || '(제목 없음)'} <span className="badge">{isPublic ? '공개' : '비공개'}</span>
+            </div>
+            <div className="m-actions">
+              <button className="btn" onClick={addSceneMobile}>+ 장면 추가</button>
+              <button className="btn" onClick={() => setPreview(true)}>▶ 미리보기</button>
+              {saveButton}
+            </div>
+            {saveMsg && <div className="m-msg">{saveMsg}</div>}
+            <SceneList scenes={scenes} startSceneId={startSceneId} selected={selected} onOpen={(key) => { setSelected(key); setMobileView('edit'); }} />
+            <div className="m-body">
+              <ValidationPanel config={config} scenes={scenes} startSceneId={startSceneId} validation={validation} setValidation={setValidation} />
+            </div>
+          </>
+        )}
+
+        {view === 'edit' && (
+          <>
+            <div className="m-bar">
+              <button className="btn" onClick={() => setMobileView('list')}>← 목록</button>
+              <div className="spacer" />
+              {saveButton}
+            </div>
+            {saveMsg && <div className="m-msg">{saveMsg}</div>}
+            <div className="m-body">
+              <SceneForm
+                key={selected}
+                sceneKey={selected} scene={scenes[selected]} scenes={scenes}
+                startSceneId={startSceneId}
+                onChange={(patch) => updateScene(selected, patch)}
+                onDelete={() => deleteScene(selected)}
+                onSetStart={() => setStartSceneId(selected)}
+                config={config}
+              />
+            </div>
+          </>
+        )}
+
+        {view === 'settings' && (
+          <>
+            <div className="m-bar">
+              <button className="btn" onClick={() => setMobileView('list')}>← 목록</button>
+              <div className="spacer" />
+              {saveButton}
+            </div>
+            {saveMsg && <div className="m-msg">{saveMsg}</div>}
+            <div className="m-body">
+              <ConfigPanel meta={meta} setMeta={setMeta} config={config} setConfig={setConfig} isPublic={isPublic} onVisibility={handleVisibility} onDelete={handleDelete} />
+            </div>
+          </>
+        )}
+
+        {preview && (
+          <PlayPreview config={config} scenes={scenes} startSceneId={startSceneId} storyTitle={meta.title} onClose={() => setPreview(false)} />
+        )}
+      </div>
+    );
+  }
+
+  // ───────────── 데스크톱(넓은 화면): 3단 + 그래프 ─────────────
   return (
     <div className="editor-layout">
       <div className="editor-col">
@@ -689,6 +854,7 @@ export default function Editor({ storyId, onBack }) {
       <div className="editor-col">
         {selected && scenes[selected] ? (
           <SceneForm
+            key={selected}
             sceneKey={selected} scene={scenes[selected]} scenes={scenes}
             startSceneId={startSceneId}
             onChange={(patch) => updateScene(selected, patch)}

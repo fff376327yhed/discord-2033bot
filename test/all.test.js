@@ -20,6 +20,10 @@ import {
   sanitizeScenes,
   sanitizeMeta,
   createWebRouter,
+  createMemorySessionStore,
+  createMemoryRateLimitBackend,
+  createRateLimitStore,
+  isTokenRevoked,
   filterPublicStories,
   WEB,
 } from '../src/bundle.js';
@@ -474,7 +478,7 @@ describe('로그인과 권한 (HTTP)', () => {
   before(async () => {
     const app = express();
     app.use(express.json({ limit: '1mb' }));
-    app.use(createWebRouter());
+    app.use(createWebRouter({ sessionStore: createMemorySessionStore(), rateLimitBackend: createMemoryRateLimitBackend() })); // Firestore 대신 메모리
     await new Promise((resolve) => {
       server = app.listen(0, '127.0.0.1', resolve);
     });
@@ -628,5 +632,181 @@ describe('둘러보기: 검색/정렬', () => {
     assert.equal(page.total, 3);
     assert.equal(page.tags[0].tag, '생존');
     assert.equal(page.tags[0].count, 2);
+  });
+});
+
+// ═════════════════════════════════════════════
+// 7단계: 로그아웃 토큰 무효화
+// ═════════════════════════════════════════════
+describe('로그아웃 토큰 무효화', () => {
+  const OTHER_ID = '333333333333333333'; // 다른 테스트의 로그인에 영향을 주지 않도록 별도 사용자
+  const startServer = async (sessionStore) => {
+    const app = express();
+    app.use(express.json());
+    app.use(createWebRouter({ sessionStore, rateLimitBackend: createMemoryRateLimitBackend() }));
+    const server = await new Promise((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    return { server, base: `http://127.0.0.1:${server.address().port}` };
+  };
+  const cookieAt = (now) => `${WEB.SESSION_COOKIE}=${signJwt({ sub: OTHER_ID, name: '로그아웃테스트', avatar: null }, undefined, now)}`;
+  const headers = (cookie) => ({ 'Content-Type': 'application/json', [WEB.CSRF_HEADER]: WEB.CSRF_VALUE, ...(cookie ? { Cookie: cookie } : {}) });
+  const meOf = async (base, cookie) => (await (await fetch(`${base}/api/auth/me`, { headers: { Cookie: cookie } })).json()).user;
+
+  test('isTokenRevoked: 기록이 없으면 통과, 같은 초/이전 발급은 무효, 이후 발급은 통과', () => {
+    const at = 1_700_000_000_500; // 발급 초 = 1700000000
+    assert.equal(isTokenRevoked({ iat: 1_700_000_000 }, 0), false);
+    assert.equal(isTokenRevoked({ iat: 1_699_999_999 }, at), true);
+    assert.equal(isTokenRevoked({ iat: 1_700_000_000 }, at), true); // 같은 초
+    assert.equal(isTokenRevoked({ iat: 1_700_000_001 }, at), false);
+    assert.equal(isTokenRevoked({}, at), true); // iat 없는 토큰은 무효
+  });
+
+  test('로그아웃하면 같은 토큰이 바로 쓸 수 없게 되고, 이후에 새로 발급된 토큰은 쓸 수 있다', async () => {
+    const { server, base } = await startServer(createMemorySessionStore());
+    try {
+      const old = cookieAt(Date.now());
+      assert.equal((await meOf(base, old))?.id, OTHER_ID); // 로그아웃 전에는 정상
+
+      const res = await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: headers(old) });
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { ok: true, revoked: true });
+      assert.equal(await meOf(base, old), null); // 같은 토큰 → 무효
+
+      assert.equal((await meOf(base, cookieAt(Date.now() + 3000)))?.id, OTHER_ID); // 다시 로그인한 새 토큰은 정상
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  test('무효화된 토큰으로는 쓰기 API도 401', async () => {
+    const { server, base } = await startServer(createMemorySessionStore());
+    try {
+      const old = cookieAt(Date.now());
+      await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: headers(old) });
+      const res = await fetch(`${base}/api/stories`, { method: 'POST', body: '{}', headers: headers(old) });
+      assert.equal(res.status, 401);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  test('로그인 없이 로그아웃해도 오류가 나지 않는다 (revoked:false)', async () => {
+    const { server, base } = await startServer(createMemorySessionStore());
+    try {
+      const res = await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: headers() });
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { ok: true, revoked: false });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  test('로그아웃 기록을 읽다 오류가 나면 로그인 안 한 것으로 처리한다 (안전하게 닫힘)', async () => {
+    const broken = { getValidAfter: async () => { throw new Error('Firestore 장애'); }, revoke: async () => {} };
+    const { server, base } = await startServer(broken);
+    const original = console.error;
+    console.error = () => {}; // 테스트 출력이 지저분해지지 않게 오류 로그만 잠시 끈다
+    try {
+      assert.equal(await meOf(base, cookieAt(Date.now())), null);
+    } finally {
+      console.error = original;
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  test('로그아웃 기록을 쓰다 오류가 나도 쿠키는 지워지고 revoked:false로 알려준다', async () => {
+    const broken = { getValidAfter: async () => 0, revoke: async () => { throw new Error('쓰기 실패'); } };
+    const { server, base } = await startServer(broken);
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const res = await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: headers(cookieAt(Date.now())) });
+      assert.deepEqual(await res.json(), { ok: true, revoked: false });
+      assert.ok(res.headers.getSetCookie().some((c) => c.startsWith(`${WEB.SESSION_COOKIE}=;`)));
+    } finally {
+      console.error = original;
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
+// ═════════════════════════════════════════════
+// 7단계: 서버가 여러 개여도 함께 세는 속도제한
+// ═════════════════════════════════════════════
+describe('공유 속도제한 저장소', () => {
+  test('서버 두 개가 같은 카운터를 공유하면 합쳐서 센다', async () => {
+    const backend = createMemoryRateLimitBackend();
+    const serverA = createRateLimitStore('auth', backend);
+    const serverB = createRateLimitStore('auth', backend);
+    serverA.init({ windowMs: 60_000 });
+    serverB.init({ windowMs: 60_000 });
+    await serverA.increment('1.2.3.4');
+    await serverB.increment('1.2.3.4');
+    await serverA.increment('1.2.3.4');
+    assert.equal((await serverB.increment('1.2.3.4')).totalHits, 4);
+    assert.equal((await serverB.increment('9.9.9.9')).totalHits, 1); // 다른 키는 따로
+  });
+
+  test('1분 칸이 바뀌면 0부터 다시 센다, 이름(prefix)이 다르면 따로 센다', async () => {
+    let t = 1_700_000_000_000;
+    const backend = createMemoryRateLimitBackend();
+    const store = createRateLimitStore('write', backend, { now: () => t });
+    store.init({ windowMs: 60_000 });
+    await store.increment('user:1');
+    assert.equal((await store.increment('user:1')).totalHits, 2);
+    t += 61_000;
+    assert.equal((await store.increment('user:1')).totalHits, 1);
+
+    const other = createRateLimitStore('auth', backend, { now: () => t });
+    other.init({ windowMs: 60_000 });
+    assert.equal((await other.increment('user:1')).totalHits, 1);
+  });
+
+  test('문서 ID는 해시라서 IP나 유저 ID가 그대로 들어가지 않는다', async () => {
+    const seen = [];
+    const spy = { async hit(docId) { seen.push(docId); return 1; } };
+    const store = createRateLimitStore('auth', spy);
+    store.init({ windowMs: 60_000 });
+    await store.increment('203.0.113.7');
+    assert.match(seen[0], /^[0-9a-f]{40}$/);
+  });
+
+  test('공유 카운터가 고장 나면 이 서버 메모리로 대신 센다 (제한이 풀리지 않는다)', async () => {
+    const broken = { async hit() { throw new Error('Firestore 장애'); } };
+    const store = createRateLimitStore('auth', broken);
+    store.init({ windowMs: 60_000 });
+    const original = console.error;
+    console.error = () => {};
+    try {
+      await store.increment('ip');
+      await store.increment('ip');
+      assert.equal((await store.increment('ip')).totalHits, 3);
+    } finally {
+      console.error = original;
+    }
+  });
+
+  test('HTTP: 서버(라우터) 두 개가 카운터를 공유하면 로그인 요청 21번째에서 429', async () => {
+    const backend = createMemoryRateLimitBackend();
+    const boot = async () => {
+      const app = express();
+      app.use(createWebRouter({ sessionStore: createMemorySessionStore(), rateLimitBackend: backend }));
+      const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+      return { server, base: `http://127.0.0.1:${server.address().port}` };
+    };
+    const a = await boot();
+    const b = await boot();
+    try {
+      const statuses = [];
+      for (let i = 0; i < 21; i += 1) {
+        const target = i % 2 === 0 ? a.base : b.base; // 번갈아 두 서버로 보낸다
+        statuses.push((await fetch(`${target}/api/auth/login`, { redirect: 'manual' })).status);
+      }
+      assert.ok(statuses.slice(0, 20).every((code) => code === 302), statuses.join(','));
+      assert.equal(statuses[20], 429);
+    } finally {
+      await Promise.all([a, b].map(({ server }) => new Promise((resolve) => server.close(resolve))));
+    }
   });
 });

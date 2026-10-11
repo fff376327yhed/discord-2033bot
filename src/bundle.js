@@ -4,7 +4,7 @@
 // 다른 코드는 이 파일에서만 import 한다. 예) import { handleInteraction, createWebRouter } from '../src/bundle.js';
 
 import 'dotenv/config'; // 로컬에서는 .env를 읽고, Vercel에서는 대시보드 환경 변수가 이미 들어 있음
-import { randomUUID, randomBytes, createHmac, timingSafeEqual, createPublicKey, verify as cryptoVerify } from 'node:crypto';
+import { randomUUID, randomBytes, createHash, createHmac, timingSafeEqual, createPublicKey, verify as cryptoVerify } from 'node:crypto';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
@@ -21,6 +21,7 @@ export const COL = {
   SESSIONS: 'playSessions',   // playSessions/{유저ID}_{스토리ID}
   ENDINGS: 'endingsSeen',     // endingsSeen/{유저ID}_{스토리ID}
   LIKES: 'likes',             // likes/{유저ID}_{스토리ID}  (6단계: 문서 ID가 곧 중복 방지)
+  RATE_LIMITS: 'rateLimits',  // rateLimits/{해시}  (7단계: 서버가 여러 개여도 함께 세는 속도제한 카운터)
 };
 
 // 필드 설명은 원본 collections.js 주석 참고 (users, stories, scenes, playSessions, endingsSeen)
@@ -1607,6 +1608,8 @@ export const WEB = {
   SESSION_COOKIE: 'h2033_session', // 로그인 유지용 JWT 쿠키
   STATE_COOKIE: 'h2033_state',     // 로그인 도중에만 쓰는 CSRF 방지용 임시 쿠키
   SESSION_DAYS: 7,                 // 로그인 유지 기간
+  SESSION_CHECK_CACHE_MS: 15_000,  // 로그아웃 확인 결과를 메모리에 기억하는 시간 (읽기 비용 절약)
+  SESSION_CACHE_MAX: 2000,         // 기억해 둘 사용자 수 상한 (메모리 폭주 방지)
   MAX_STORIES_PER_USER: 30,        // 한 사람이 만들 수 있는 스토리 수 (서버 비용 폭주 방지)
   CSRF_HEADER: 'x-requested-with', // 쓰기 요청에 반드시 붙여야 하는 헤더 이름
   CSRF_VALUE: 'haejung',           // 위 헤더의 값
@@ -2193,6 +2196,116 @@ const redirectUri = () => `${siteUrl()}/api/auth/callback`;
 // 쿠키 공통 옵션: JS에서 못 읽고(httpOnly), 다른 사이트 요청에는 안 붙고(lax), HTTPS에서만 전송(secure)
 const cookieBase = () => ({ httpOnly: true, sameSite: 'lax', secure: siteUrl().startsWith('https://') });
 
+// ═════════════════════════════════════════════
+// 로그아웃 토큰 무효화 (7단계)
+// ═════════════════════════════════════════════
+// JWT는 서버가 기억하지 않아서, 로그아웃해도 토큰은 만료(7일) 전까지 "서명이 맞는 토큰"으로 남는다.
+// 그래서 users/{ID}.sessionsValidAfter(밀리초) 한 칸을 둔다.
+//   "이 시각 이전(같은 초 포함)에 발급된 로그인 토큰은 모두 무효"
+// 로그아웃하면 이 값을 지금 시각으로 올린다. → 쿠키를 훔쳐 간 사람도 그 순간부터 못 쓴다.
+// 대가: 한 기기에서 로그아웃하면 모든 기기가 같이 로그아웃된다.
+// (이 칸은 7단계 운영 기능에서 "사용자 차단 시 강제 로그아웃"에도 그대로 쓸 수 있다.)
+
+/** 토큰이 로그아웃으로 무효화됐는지. iat는 "초" 단위라서 같은 초에 발급된 토큰도 무효로 본다. */
+export function isTokenRevoked(payload, validAfterMs) {
+  if (!Number.isFinite(validAfterMs) || validAfterMs <= 0) return false; // 한 번도 로그아웃한 적 없음
+  return !(payload.iat > Math.floor(validAfterMs / 1000)); // iat가 이상한 값이어도(NaN) 무효 처리
+}
+
+/** 메모리 저장소: 테스트와 로컬 실험용 (서버가 꺼지면 사라진다) */
+export function createMemorySessionStore() {
+  const map = new Map();
+  return {
+    async getValidAfter(userId) { return map.get(userId) ?? 0; },
+    async revoke(userId, now = Date.now()) { map.set(userId, now); },
+  };
+}
+
+/** Firestore 저장소: 읽기 결과를 15초 동안 인스턴스 메모리에 기억한다. */
+export function createFirestoreSessionStore() {
+  const cache = new Map(); // userId → { validAfter, at }
+  const remember = (userId, validAfter, at) => {
+    if (cache.size >= WEB.SESSION_CACHE_MAX) cache.clear(); // 가득 차면 통째로 비운다 (단순하고 안전)
+    cache.set(userId, { validAfter, at });
+  };
+  return {
+    async getValidAfter(userId, now = Date.now()) {
+      const hit = cache.get(userId);
+      if (hit && now - hit.at < WEB.SESSION_CHECK_CACHE_MS) return hit.validAfter;
+      const snap = await getDb().collection(COL.USERS).doc(userId).get();
+      const validAfter = Number(snap.get('sessionsValidAfter')) || 0;
+      remember(userId, validAfter, now);
+      return validAfter;
+    },
+    async revoke(userId, now = Date.now()) {
+      await getDb().collection(COL.USERS).doc(userId).set({ sessionsValidAfter: now }, { merge: true });
+      remember(userId, now, now); // 이 인스턴스는 바로 반영 (다른 인스턴스는 최대 15초 뒤)
+    },
+  };
+}
+
+// ═════════════════════════════════════════════
+// 서버 전체가 함께 세는 속도제한 (7단계)
+// ═════════════════════════════════════════════
+// express-rate-limit 기본 저장소는 "서버(인스턴스) 메모리"라서, Vercel이 서버를 여러 개 띄우면 각자 따로 센다.
+// 그래서 민감한 곳(로그인, 쓰기)만 Firestore 카운터로 센다. 요청 1번에 쓰기 1번 + 읽기 1번이 든다.
+// 둘러보기/전체 제한은 비용 때문에 기존 메모리 방식을 그대로 둔다. (대충 막는 용도)
+// 방식: 1분짜리 "칸"마다 문서 하나를 두고 +1 한다. (칸이 바뀌면 자동으로 0부터)
+// 문서 ID는 해시라서 IP/유저 ID가 Firestore에 그대로 남지 않는다.
+// expireAt 필드는 Firestore TTL 정책을 켜면 자동 삭제된다. (켜지 않아도 동작하며, 7-3 정리 작업에서 지울 수도 있다.)
+
+/** 메모리 백엔드: 테스트용 (여러 저장소가 하나를 공유하면 "서버 여러 개"를 흉내 낼 수 있다) */
+export function createMemoryRateLimitBackend() {
+  const counts = new Map();
+  return { async hit(docId) { const n = (counts.get(docId) ?? 0) + 1; counts.set(docId, n); return n; } };
+}
+
+/** Firestore 백엔드: rateLimits/{docId}.count 를 원자적으로 +1 하고 현재 값을 돌려준다. */
+export function createFirestoreRateLimitBackend() {
+  return {
+    async hit(docId, expireAt) {
+      const ref = getDb().collection(COL.RATE_LIMITS).doc(docId);
+      await ref.set({ count: FieldValue.increment(1), expireAt }, { merge: true });
+      return Number((await ref.get()).get('count')) || 1;
+    },
+  };
+}
+
+/** express-rate-limit 에 꽂는 저장소. Firestore가 실패하면 이 서버 메모리로 대신 센다. (제한이 풀려 버리는 것보다 낫다) */
+export function createRateLimitStore(prefix, backend, { now = () => Date.now() } = {}) {
+  let windowMs = 60_000;
+  const local = new Map(); // 대비책: key → { count, resetAt }
+  const docIdOf = (key, windowIndex) =>
+    createHash('sha256').update(`${prefix}|${key}|${windowIndex}`).digest('hex').slice(0, 40);
+
+  function localIncrement(key, resetAt) {
+    if (local.size > 5000) for (const [k, v] of local) if (v.resetAt <= now()) local.delete(k); // 오래된 것 정리
+    const entry = local.get(key);
+    const next = entry && entry.resetAt > now() ? { count: entry.count + 1, resetAt } : { count: 1, resetAt };
+    local.set(key, next);
+    return next.count;
+  }
+
+  return {
+    localKeys: false, // "여러 서버가 공유하는 저장소"라는 표시
+    init(options) { windowMs = options.windowMs; },
+    async increment(key) {
+      const windowIndex = Math.floor(now() / windowMs);
+      const resetAt = (windowIndex + 1) * windowMs;
+      let totalHits;
+      try {
+        totalHits = await backend.hit(docIdOf(key, windowIndex), new Date(resetAt + windowMs));
+      } catch (err) {
+        console.error('[속도제한] 공유 카운터 실패, 이 서버 메모리로 대신 셉니다', err?.message ?? err);
+        totalHits = localIncrement(key, resetAt);
+      }
+      return { totalHits, resetTime: new Date(resetAt) };
+    },
+    async decrement() {},  // 쓰지 않는 기능 (skipFailedRequests 등을 켜지 않았다)
+    async resetKey() {},   // 쓰지 않는 기능
+  };
+}
+
 async function discordFetch(url, options) {
   return fetch(url, { ...options, signal: AbortSignal.timeout(8000) }); // 8초 안에 응답 없으면 포기
 }
@@ -2201,18 +2314,27 @@ async function discordFetch(url, options) {
 // 라우터
 // ═════════════════════════════════════════════
 
-export function createWebRouter() {
+// options.sessionStore: 로그아웃 기록을 읽고 쓰는 곳. 기본은 Firestore, 테스트에서는 메모리 저장소를 넣는다.
+// options.rateLimitBackend: 로그인/쓰기 속도제한 카운터를 두는 곳. 기본은 Firestore, 테스트에서는 메모리.
+export function createWebRouter({
+  sessionStore = createFirestoreSessionStore(),
+  rateLimitBackend = createFirestoreRateLimitBackend(),
+} = {}) {
   const router = express.Router();
 
-  // 로그인 관련 요청은 더 엄격하게 제한 (IP당 1분 20회)
-  const authLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
-  // 쓰기 요청은 "사용자별" 1분 30회 (로그인 후에만 쓰이므로 req.user가 항상 있다)
+  // 로그인 관련 요청은 더 엄격하게 제한 (IP당 1분 20회). 서버가 여러 개여도 함께 센다. (7단계)
+  const authLimiter = rateLimit({
+    windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false,
+    store: createRateLimitStore('auth', rateLimitBackend),
+  });
+  // 쓰기 요청은 "사용자별" 1분 30회 (로그인 후에만 쓰이므로 req.user가 항상 있다). 서버가 여러 개여도 함께 센다. (7단계)
   const writeLimiter = rateLimit({
     windowMs: 60_000,
     limit: 30,
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => `user:${req.user.id}`,
+    store: createRateLimitStore('write', rateLimitBackend),
   });
 
   // 모든 API 응답은 캐시하지 않는다 (로그인 상태가 섞이는 것을 방지)
@@ -2232,25 +2354,40 @@ export function createWebRouter() {
     next();
   });
 
-  // 로그인 쿠키(JWT)를 읽어 req.user 를 채운다. 유효하지 않으면 null
-  function readUser(req) {
+  // 쿠키의 JWT가 "서명/만료" 기준으로 올바른지만 본다 (Firestore를 읽지 않음)
+  function readPayload(req) {
     const token = parseCookies(req.headers.cookie)[WEB.SESSION_COOKIE];
     const payload = token ? verifyJwt(token) : null;
     if (!payload || !DISCORD_ID_PATTERN.test(String(payload.sub))) return null;
+    return payload;
+  }
+
+  // 로그인 쿠키(JWT)를 읽어 사용자를 돌려준다. 위조/만료/로그아웃으로 무효화된 토큰이면 null.
+  // 로그아웃 기록을 확인하다 오류가 나면 "로그인 안 한 사람"으로 취급한다 (안전한 쪽으로 닫는다).
+  async function readUser(req) {
+    const payload = readPayload(req);
+    if (!payload) return null;
+    const id = String(payload.sub);
+    try {
+      if (isTokenRevoked(payload, await sessionStore.getValidAfter(id))) return null;
+    } catch (err) {
+      console.error('[auth] 로그아웃 기록 확인 실패', err); // 상세 오류는 서버 로그에만
+      return null;
+    }
     return {
-      id: String(payload.sub),
+      id,
       username: String(payload.name ?? '').slice(0, 80),
       avatar: typeof payload.avatar === 'string' ? payload.avatar : null,
     };
   }
 
-  const optionalAuth = (req, res, next) => {
-    req.user = readUser(req);
+  const optionalAuth = async (req, res, next) => {
+    req.user = await readUser(req); // readUser는 오류를 던지지 않는다
     next();
   };
 
-  const requireAuth = (req, res, next) => {
-    req.user = readUser(req);
+  const requireAuth = async (req, res, next) => {
+    req.user = await readUser(req);
     if (!req.user) return res.status(401).json({ error: '로그인이 필요합니다.' });
     next();
   };
@@ -2345,10 +2482,21 @@ export function createWebRouter() {
     res.json({ user: req.user });
   });
 
-  // 로그아웃: 쿠키를 지운다. (JWT는 서버에 저장하지 않으므로 만료 전까지 "유효한 토큰"이 남아 있을 수 있다. 7단계에서 보강)
-  router.post('/api/auth/logout', (req, res) => {
+  // 로그아웃: 쿠키를 지우고, 서버에도 "이 시각 이전 토큰은 무효"라고 적어 둔다. (모든 기기에서 로그아웃)
+  // 이미 만료됐거나 위조된 토큰이면 적을 필요가 없으므로 쿠키만 지운다.
+  router.post('/api/auth/logout', async (req, res) => {
     res.clearCookie(WEB.SESSION_COOKIE, { ...cookieBase(), path: '/' });
-    res.json({ ok: true });
+    const payload = readPayload(req);
+    let revoked = false;
+    if (payload) {
+      try {
+        await sessionStore.revoke(String(payload.sub));
+        revoked = true;
+      } catch (err) {
+        console.error('[auth] 로그아웃 기록 실패', err); // 쿠키는 이미 지웠으므로 화면상 로그아웃은 된다
+      }
+    }
+    res.json({ ok: true, revoked });
   });
 
   // ───────────── 스토리 목록 / 생성 ─────────────
