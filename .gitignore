@@ -1,1 +1,11 @@
 2033봇 키발급.json
+node_modules/
+.env
+.env.*
+!.env.example
+serviceAccount*.json
+*-firebase-adminsdk-*.json
+.vercel/
+dist/
+.DS_Store
+serviceAccount.json
