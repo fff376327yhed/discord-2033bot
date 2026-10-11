@@ -1,5 +1,5 @@
 {
-  "name": "seoul2033",
+  "name": "haejung2023",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -7,14 +7,18 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "node scripts/dev-server.js",
-    "check": "node scripts/check-firebase.js"
-  },
+  "dev": "node scripts/dev-server.js",
+  "check": "node scripts/check-firebase.js",
+  "test": "node --test",
+  "play": "node scripts/play-cli.js",
+  "register": "node scripts/register-commands.js",
+  "seed": "node scripts/seed-sample.js"
+},
   "dependencies": {
-    "dotenv": "^18.0.7",
-    "express": "^5.3.0",
-    "express-rate-limit": "^8.7.1",
-    "firebase-admin": "^14.5.0",
-    "helmet": "^8.3.0"
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "firebase-admin": "^12.5.0",
+    "helmet": "^8.0.0"
   }
 }

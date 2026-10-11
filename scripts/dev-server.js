@@ -13,6 +13,6 @@ root.use(express.static(path.resolve(__dirname, '../public'))); // Vercel이 pub
 root.use(app);
 
 root.listen(port, () => {
-  console.log(`🚇 서울2033 로컬 서버: http://localhost:${port}`);
+  console.log(`🚇 해정2033 로컬 서버: http://localhost:${port}`);
   console.log(`   상태 확인: http://localhost:${port}/api/health`);
 });

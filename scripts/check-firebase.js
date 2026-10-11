@@ -5,7 +5,7 @@ import { getDb } from '../src/lib/firebase.js';
 const db = getDb();
 const ref = db.collection('_health').doc('check');
 
-await ref.set({ at: Date.now(), note: '서울2033 연결 테스트' });
+await ref.set({ at: Date.now(), note: '해정2033 연결 테스트' });
 console.log('✅ 쓰기 성공');
 
 const snap = await ref.get();
