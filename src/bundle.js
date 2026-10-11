@@ -20,6 +20,7 @@ export const COL = {
   SCENES: 'scenes',           // stories/{UUID}/scenes/{장면 키}  (하위 컬렉션)
   SESSIONS: 'playSessions',   // playSessions/{유저ID}_{스토리ID}
   ENDINGS: 'endingsSeen',     // endingsSeen/{유저ID}_{스토리ID}
+  LIKES: 'likes',             // likes/{유저ID}_{스토리ID}  (6단계: 문서 ID가 곧 중복 방지)
 };
 
 // 필드 설명은 원본 collections.js 주석 참고 (users, stories, scenes, playSessions, endingsSeen)
@@ -796,8 +797,17 @@ const STRING = 3;  // 문자열 옵션 종류
 export const COMMANDS = [
   {
     name: '스토리목록',
-    description: '플레이할 수 있는 공개 스토리 목록을 봅니다',
+    description: '플레이할 수 있는 공개 스토리 목록을 봅니다 (검색어로 찾을 수도 있어요)',
     type: SLASH,
+    options: [
+      {
+        type: STRING,
+        name: '검색어',
+        description: '제목, 설명, 태그에서 찾습니다',
+        required: false,
+        max_length: 50,
+      },
+    ],
   },
   {
     name: '플레이',
@@ -1022,9 +1032,12 @@ export function sceneMessage({ story, scene, state, config = {}, changes = [] })
 }
 
 /** 공개 스토리 목록 (최대 5개, 각 스토리마다 시작 버튼) */
-export function storyListMessage(stories) {
+export function storyListMessage(stories, query = '') {
   if (stories.length === 0) {
-    return { content: '아직 공개된 스토리가 없습니다.', embeds: [], components: [] };
+    const content = query
+      ? `'${truncate(query, 30)}' 검색 결과가 없습니다.`
+      : '아직 공개된 스토리가 없습니다.';
+    return { content, embeds: [], components: [] };
   }
 
   const lines = stories.map((story, i) => {
@@ -1032,7 +1045,7 @@ export function storyListMessage(stories) {
     return (
       `**${i + 1}. ${truncate(story.title, 60)}**\n` +
       `${truncate(story.description || '설명 없음', 100)}\n` +
-      `제작자 ${authorText(story.authorId)} · 플레이 ${story.playCount ?? 0}회${tags}`
+      `제작자 ${authorText(story.authorId)} · 플레이 ${story.playCount ?? 0}회 · ❤️ ${story.likeCount ?? 0}${tags}`
     );
   });
 
@@ -1132,6 +1145,163 @@ export async function getPublicStories(limit = 5) {
     .limit(limit)
     .get();
   return snap.docs.map((doc) => ({ ...doc.data(), id: doc.id }));
+}
+
+// ─────────────────────────────────────────────
+// 6단계: 공개 스토리 검색 / 좋아요 / 엔딩 도감
+// ─────────────────────────────────────────────
+
+export const BROWSE = {
+  FETCH_MAX: 200,   // 한 번에 읽어 오는 최신 공개 스토리 수 (검색 대상 범위)
+  PAGE_SIZE: 20,    // 웹 한 페이지에 보여줄 개수
+  CACHE_MS: 60_000, // 서버 메모리 캐시 유지 시간 (Firestore 읽기 비용 절약)
+  QUERY_MAX: 50,    // 검색어 최대 길이
+  TAGS_MAX: 30,     // 태그 필터 목록에 보여줄 최대 개수
+};
+
+// 인스턴스(서버리스 실행 환경) 메모리 안의 캐시
+let publicCache = { at: 0, stories: null };
+
+/** 캐시를 비운다. (좋아요 직후 호출해서 숫자가 바로 반영되게 한다) */
+export function clearPublicCache() {
+  publicCache = { at: 0, stories: null };
+}
+
+// 최신 공개 스토리 N개를 읽는다. (기존 인덱스 isPublic + createdAt desc 를 그대로 사용)
+async function loadPublicStories() {
+  const now = Date.now();
+  if (publicCache.stories && now - publicCache.at < BROWSE.CACHE_MS) return publicCache.stories;
+
+  const snap = await getDb()
+    .collection(COL.STORIES)
+    .where('isPublic', '==', true)
+    .orderBy('createdAt', 'desc')
+    .limit(BROWSE.FETCH_MAX)
+    .get();
+  const stories = snap.docs.map((doc) => summarize(doc.id, doc.data()));
+  publicCache = { at: now, stories };
+  return stories;
+}
+
+/**
+ * 순수 함수: 목록에서 검색어/태그로 거르고, 정렬하고, 페이지를 자른다. (테스트하기 쉽게 DB와 분리)
+ * @returns {{ stories, total, tags }}  tags = [{ tag, count }] 많이 쓰인 순
+ */
+export function filterPublicStories(all, { q = '', tag = '', sort = 'latest', offset = 0, limit = BROWSE.PAGE_SIZE } = {}) {
+  const needle = String(q).trim().toLowerCase();
+  const tagNeedle = String(tag).trim().toLowerCase();
+  const text = (value) => String(value ?? '').toLowerCase();
+
+  let list = all.filter((story) => {
+    const tags = Array.isArray(story.tags) ? story.tags : [];
+    if (tagNeedle && !tags.some((t) => text(t) === tagNeedle)) return false;
+    if (!needle) return true;
+    return text(story.title).includes(needle) || text(story.description).includes(needle) || tags.some((t) => text(t).includes(needle));
+  });
+
+  if (sort === 'popular') {
+    // 좋아요 → 플레이 수 → 최신 순
+    list = [...list].sort(
+      (a, b) => (b.likeCount ?? 0) - (a.likeCount ?? 0) || (b.playCount ?? 0) - (a.playCount ?? 0) || (b.createdAt ?? 0) - (a.createdAt ?? 0)
+    );
+  }
+
+  // 태그 목록은 "검색 전체 범위" 기준으로 센다 (필터를 걸어도 다른 태그를 고를 수 있게)
+  const counts = new Map();
+  for (const story of all) {
+    for (const t of Array.isArray(story.tags) ? story.tags : []) {
+      const key = text(t);
+      const prev = counts.get(key) ?? { tag: t, count: 0 };
+      counts.set(key, { tag: prev.tag, count: prev.count + 1 });
+    }
+  }
+  const tags = [...counts.values()].sort((a, b) => b.count - a.count).slice(0, BROWSE.TAGS_MAX);
+
+  return { stories: list.slice(offset, offset + limit), total: list.length, tags };
+}
+
+/** 공개 스토리 검색 (웹 둘러보기 + 디스코드 /스토리목록 공용) */
+export async function searchPublicStories(options = {}) {
+  return filterPublicStories(await loadPublicStories(), options);
+}
+
+/** 좋아요 켜기/끄기. 이미 그 상태면 아무것도 바꾸지 않는다. (여러 번 눌러도 안전) */
+export async function setLike(userId, storyId, liked) {
+  const db = getDb();
+  const likeRef = db.collection(COL.LIKES).doc(userStoryKey(userId, storyId)); // 문서 ID = 유저+스토리 → 중복 불가능
+
+  return db.runTransaction(async (tx) => {
+    const [storySnap, likeSnap] = await Promise.all([tx.get(refs.story(storyId)), tx.get(likeRef)]);
+    // 없는 스토리와 비공개 스토리는 똑같이 "없음"으로 처리 (존재 여부 숨김)
+    if (!storySnap.exists || !storySnap.get('isPublic')) return { ok: false, code: 'NO_STORY' };
+
+    let likeCount = storySnap.get('likeCount') ?? 0;
+    if (liked && !likeSnap.exists) {
+      tx.set(likeRef, { userId, storyId, createdAt: Date.now() });
+      tx.update(refs.story(storyId), { likeCount: FieldValue.increment(1) });
+      likeCount += 1;
+    } else if (!liked && likeSnap.exists) {
+      tx.delete(likeRef);
+      tx.update(refs.story(storyId), { likeCount: FieldValue.increment(-1) });
+      likeCount = Math.max(0, likeCount - 1);
+    }
+    return { ok: true, liked, likeCount };
+  });
+}
+
+/** 이 유저가 좋아요한 스토리 ID 모음 (목록 한 페이지분을 한 번에 조회) */
+export async function getLikedSet(userId, storyIds) {
+  if (!userId || storyIds.length === 0) return new Set();
+  const db = getDb();
+  const snaps = await db.getAll(...storyIds.map((id) => db.collection(COL.LIKES).doc(userStoryKey(userId, id))));
+  return new Set(snaps.filter((snap) => snap.exists).map((snap) => snap.get('storyId')));
+}
+
+/** 제작자 이름 조회 (users 문서). 없는 사람은 맵에 안 들어간다 */
+export async function getUserNames(userIds) {
+  const ids = [...new Set(userIds)].filter((id) => /^\d{5,25}$/.test(String(id)));
+  if (ids.length === 0) return new Map();
+  const db = getDb();
+  const snaps = await db.getAll(...ids.map((id) => db.collection(COL.USERS).doc(id)));
+  return new Map(snaps.filter((snap) => snap.exists).map((snap) => [snap.id, snap.get('username')]));
+}
+
+/**
+ * 스토리 1개의 엔딩 도감. 못 본 엔딩의 이름/종류는 스포일러라서 내려주지 않고 "개수"만 알려준다.
+ * 스토리가 없거나 볼 권한이 없으면 null
+ */
+export async function getEndingBook(userId, storyId) {
+  const storySnap = await refs.story(storyId).get();
+  if (!storySnap.exists) return null;
+  const story = storySnap.data();
+  if (!story.isPublic && story.authorId !== userId) return null;
+
+  const [endingScenes, seenSnap] = await Promise.all([
+    refs.story(storyId).collection(COL.SCENES).where('isEnding', '==', true).select('endingName', 'endingType').get(),
+    refs.ending(userId, storyId).get(),
+  ]);
+  const seenMap = seenSnap.exists ? (seenSnap.get('endings') ?? {}) : {};
+
+  const seen = [];
+  for (const doc of endingScenes.docs) {
+    if (!Object.hasOwn(seenMap, doc.id)) continue; // 지금도 존재하는 엔딩만 센다 (삭제된 장면은 제외)
+    seen.push({
+      sceneId: doc.id,
+      name: doc.get('endingName') ?? doc.id,
+      type: doc.get('endingType') ?? null,
+      seenAt: Number(seenMap[doc.id]) || 0,
+    });
+  }
+  seen.sort((a, b) => b.seenAt - a.seenAt);
+
+  return { storyId, title: story.title, total: endingScenes.size, seenCount: seen.length, seen };
+}
+
+/** 내가 엔딩을 본 적 있는 스토리들의 도감 (최대 max개. 스토리마다 읽기가 늘어서 제한) */
+export async function listMyEndingBooks(userId, max = 20) {
+  const snap = await getDb().collection(COL.ENDINGS).where('userId', '==', userId).limit(max).get();
+  const books = await Promise.all(snap.docs.map((doc) => getEndingBook(userId, doc.get('storyId'))));
+  return books.filter(Boolean).sort((a, b) => b.seenCount - a.seenCount);
 }
 
 /**
@@ -1340,12 +1510,15 @@ async function handleCommand(interaction) {
   if (!user.id) return errorReply('유저 정보를 확인할 수 없습니다.');
 
   switch (interaction.data?.name) {
-    case '스토리목록':
-      return reply(storyListMessage(await getPublicStories(5)));
+    case '스토리목록': {
+      const query = (getStringOption(interaction, '검색어') ?? '').trim().slice(0, BROWSE.QUERY_MAX);
+      const { stories } = await searchPublicStories({ q: query, limit: 5 }); // 버튼이 한 줄 5개라서 5개
+      return reply(storyListMessage(stories, query));
+    }
 
     case '플레이': {
       const storyId = getStringOption(interaction, '스토리')?.trim();
-      if (!storyId) return reply(storyListMessage(await getPublicStories(5)));
+      if (!storyId) return reply(storyListMessage((await searchPublicStories({ limit: 5 })).stories));
       if (!STORY_ID_PATTERN.test(storyId)) return errorReply('올바르지 않은 스토리 ID입니다.');
       return startFlow(user, storyId, reply);
     }
@@ -2443,7 +2616,95 @@ export function createWebRouter() {
 
       const sessionsDone = await deleteByStoryId(db, COL.SESSIONS, id);
       const endingsDone = await deleteByStoryId(db, COL.ENDINGS, id);
-      res.json({ ok: true, cleanup: sessionsDone && endingsDone ? 'complete' : 'partial' });
+      const likesDone = await deleteByStoryId(db, COL.LIKES, id); // 6단계: 좋아요 기록도 함께 정리
+      clearPublicCache();
+      res.json({ ok: true, cleanup: sessionsDone && endingsDone && likesDone ? 'complete' : 'partial' });
+    })
+  );
+
+  // ───────────── 6단계: 둘러보기 / 좋아요 / 엔딩 도감 ─────────────
+
+  // 둘러보기는 로그인 없이도 볼 수 있어서 IP당 1분 60회로 제한한다.
+  const browseLimiter = rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: true, legacyHeaders: false });
+
+  // 쿼리스트링의 숫자를 안전하게 정수로 (이상한 값이면 기본값)
+  const toInt = (value, min, max, fallback) => {
+    const n = Number.parseInt(String(value), 10);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+  };
+  // ?q=a&q=b 처럼 배열로 오는 값은 무시한다
+  const queryText = (value, max) => (typeof value === 'string' ? value.slice(0, max) : '');
+
+  // 공개 스토리 목록: ?q=검색어&tag=태그&sort=latest|popular&offset=0
+  router.get(
+    '/api/browse',
+    browseLimiter,
+    optionalAuth,
+    wrap(async (req, res) => {
+      const offset = toInt(req.query.offset, 0, BROWSE.FETCH_MAX, 0);
+      const result = await searchPublicStories({
+        q: queryText(req.query.q, BROWSE.QUERY_MAX),
+        tag: queryText(req.query.tag, LIMITS.TAG_LENGTH),
+        sort: req.query.sort === 'popular' ? 'popular' : 'latest',
+        offset,
+        limit: BROWSE.PAGE_SIZE,
+      });
+
+      const [liked, names] = await Promise.all([
+        getLikedSet(req.user?.id, result.stories.map((story) => story.id)),
+        getUserNames(result.stories.map((story) => story.authorId)),
+      ]);
+
+      res.json({
+        stories: result.stories.map((story) => ({
+          ...story,
+          authorName: names.get(story.authorId) ?? null, // 없으면 화면에서 "운영자"로 표시
+          liked: liked.has(story.id),
+        })),
+        total: result.total,
+        tags: result.tags,
+        offset,
+        pageSize: BROWSE.PAGE_SIZE,
+        hasMore: offset + result.stories.length < result.total,
+      });
+    })
+  );
+
+  // 좋아요 켜기/끄기: body { liked: true | false }. 같은 요청을 몇 번 보내도 결과가 같다.
+  router.put(
+    '/api/stories/:id/like',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const liked = isPlainObject(req.body) ? req.body.liked : undefined;
+      if (typeof liked !== 'boolean') throw new HttpError(400, 'liked는 true/false여야 합니다.');
+
+      const result = await setLike(req.user.id, id, liked);
+      if (!result.ok) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
+      clearPublicCache(); // 이 인스턴스의 목록 캐시를 비워 숫자가 바로 보이게 한다
+      res.json({ ok: true, liked: result.liked, likeCount: result.likeCount });
+    })
+  );
+
+  // 스토리 1개의 내 엔딩 도감
+  router.get(
+    '/api/stories/:id/endings',
+    requireAuth,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const book = await getEndingBook(req.user.id, id);
+      if (!book) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
+      res.json(book);
+    })
+  );
+
+  // 내가 엔딩을 본 모든 스토리의 도감 (최대 20개)
+  router.get(
+    '/api/me/endings',
+    requireAuth,
+    wrap(async (req, res) => {
+      res.json({ books: await listMyEndingBooks(req.user.id, 20) });
     })
   );
 

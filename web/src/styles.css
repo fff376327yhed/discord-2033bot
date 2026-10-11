@@ -1,0 +1,61 @@
+:root {
+  --bg: #111; --panel: #1b1b1f; --panel2: #202026; --border: #2d2d35;
+  --text: #ddd; --muted: #888; --accent: #8ab4f8; --danger: #ed4245; --good: #57f287; --warn: #fee75c;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, 'Malgun Gothic', sans-serif; }
+button { cursor: pointer; font: inherit; }
+input, textarea, select { font: inherit; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+textarea { resize: vertical; width: 100%; }
+.btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; }
+.btn:hover { border-color: var(--accent); }
+.btn-primary { background: var(--accent); color: #111; border-color: var(--accent); font-weight: 600; }
+.btn-danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+.btn-small { padding: 3px 8px; font-size: 12px; }
+
+.center-screen { min-height: 100vh; display: grid; place-items: center; }
+.login-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px; }
+
+.topbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
+.topbar .spacer { flex: 1; }
+.topbar .user { color: var(--muted); font-size: 13px; }
+
+.story-list { max-width: 760px; margin: 24px auto; padding: 0 16px; display: grid; gap: 12px; }
+.story-row { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; cursor: pointer; }
+.story-row .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.tag-pill { display: inline-block; background: var(--panel2); border-radius: 999px; padding: 2px 8px; font-size: 11px; margin-right: 4px; }
+
+.editor-layout { display: grid; grid-template-columns: 260px 1fr 360px; height: calc(100vh - 49px); }
+.editor-col { overflow-y: auto; border-right: 1px solid var(--border); padding: 12px; }
+.editor-col:last-child { border-right: none; }
+
+.scene-node { position: absolute; width: 180px; background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 8px; cursor: grab; user-select: none; font-size: 12px; }
+.scene-node.selected { border-color: var(--accent); }
+.scene-node.ending { border-color: var(--good); }
+.scene-node.start-marker { box-shadow: 0 0 0 2px var(--warn); }
+.scene-node .title { font-weight: 600; margin-bottom: 4px; word-break: break-all; }
+.scene-node .body-preview { color: var(--muted); font-size: 11px; max-height: 32px; overflow: hidden; }
+.graph-canvas { position: relative; overflow: auto; height: 100%; background-image: radial-gradient(var(--border) 1px, transparent 1px); background-size: 20px 20px; }
+
+.field { margin-bottom: 12px; }
+.field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.field input, .field textarea, .field select { width: 100%; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row > * { flex: 1; }
+
+.list-item { border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px; background: var(--panel2); }
+.list-item .list-item-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+
+.panel-title { font-weight: 700; margin: 4px 0 10px; display: flex; justify-content: space-between; align-items: center; }
+
+.validation-ok { color: var(--good); }
+.validation-error { color: var(--danger); }
+.validation-warn { color: var(--warn); }
+.validation-list { font-size: 12px; margin: 4px 0; padding-left: 18px; }
+
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: grid; place-items: center; z-index: 50; }
+.modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: min(520px, 90vw); max-height: 85vh; overflow-y: auto; }
+
+.choice-btn { display: block; width: 100%; text-align: left; margin-top: 6px; }
+.choice-btn.locked { opacity: .5; }
+.badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: var(--panel2); color: var(--muted); }

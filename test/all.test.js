@@ -20,6 +20,7 @@ import {
   sanitizeScenes,
   sanitizeMeta,
   createWebRouter,
+  filterPublicStories,
   WEB,
 } from '../src/bundle.js';
 
@@ -569,5 +570,63 @@ describe('로그인과 권한 (HTTP)', () => {
     });
     assert.equal(bad.status, 400);
     assert.ok((await bad.json()).details.some((msg) => msg.includes('imageUrl')));
+  });
+  test('좋아요: 보안 헤더 없으면 403, 로그인 없으면 401, liked가 불리언이 아니면 DB 전에 400', async () => {
+    const url = `${base}/api/stories/abc/like`;
+    const noHeader = await fetch(url, { method: 'PUT', body: '{"liked":true}', headers: { 'Content-Type': 'application/json' } });
+    assert.equal(noHeader.status, 403);
+
+    const noLogin = await fetch(url, { method: 'PUT', body: '{"liked":true}', headers: writeHeaders() });
+    assert.equal(noLogin.status, 401);
+
+    const badBody = await fetch(url, { method: 'PUT', body: '{"liked":"yes"}', headers: writeHeaders(loginCookie()) });
+    assert.equal(badBody.status, 400);
+
+    const badId = await fetch(`${base}/api/stories/bad%20id/like`, { method: 'PUT', body: '{"liked":true}', headers: writeHeaders(loginCookie()) });
+    assert.equal(badId.status, 400);
+  });
+
+  test('엔딩 도감 API는 로그인이 필요하다', async () => {
+    assert.equal((await fetch(`${base}/api/stories/abc/endings`)).status, 401);
+    assert.equal((await fetch(`${base}/api/me/endings`)).status, 401);
+  });
+});
+
+// ═════════════════════════════════════════════
+// 6단계: 둘러보기 검색/정렬 (DB 없이 순수 함수만 확인)
+// ═════════════════════════════════════════════
+describe('둘러보기: 검색/정렬', () => {
+  const mk = (id, extra) => ({ id, title: id, description: '', tags: [], likeCount: 0, playCount: 0, createdAt: 0, ...extra });
+  const all = [
+    mk('지하철 생존기', { tags: ['생존', 'Metro'], likeCount: 1, playCount: 50, createdAt: 3 }),
+    mk('시장 이야기', { description: '한자 동맹 상인', tags: ['시장'], likeCount: 5, playCount: 10, createdAt: 2 }),
+    mk('레드라인', { tags: ['생존'], likeCount: 5, playCount: 20, createdAt: 1 }),
+  ];
+
+  test('검색어는 제목/설명/태그에서 대소문자 구분 없이 찾는다', () => {
+    assert.equal(filterPublicStories(all, { q: '생존기' }).total, 1);
+    assert.equal(filterPublicStories(all, { q: '한자' }).stories[0].id, '시장 이야기');
+    assert.equal(filterPublicStories(all, { q: 'metro' }).stories[0].id, '지하철 생존기');
+    assert.equal(filterPublicStories(all, { q: '없는말' }).total, 0);
+  });
+
+  test('태그 필터는 정확히 일치하는 태그만 통과시킨다', () => {
+    assert.equal(filterPublicStories(all, { tag: '생존' }).total, 2);
+    assert.equal(filterPublicStories(all, { tag: '생' }).total, 0);
+  });
+
+  test('인기순: 좋아요 → 플레이 수 순, 최신순은 입력 순서 유지', () => {
+    const popular = filterPublicStories(all, { sort: 'popular' }).stories.map((s) => s.id);
+    assert.deepEqual(popular, ['레드라인', '시장 이야기', '지하철 생존기']);
+    const latest = filterPublicStories(all, { sort: 'latest' }).stories.map((s) => s.id);
+    assert.deepEqual(latest, ['지하철 생존기', '시장 이야기', '레드라인']);
+  });
+
+  test('페이지 자르기와 전체 개수, 태그 집계', () => {
+    const page = filterPublicStories(all, { offset: 1, limit: 1 });
+    assert.equal(page.stories.length, 1);
+    assert.equal(page.total, 3);
+    assert.equal(page.tags[0].tag, '생존');
+    assert.equal(page.tags[0].count, 2);
   });
 });

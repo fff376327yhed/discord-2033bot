@@ -1,8 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '../api.js';
 import ConfigPanel from './ConfigPanel.jsx';
-import SceneGraph from './SceneGraph.jsx';
-import SceneForm from './SceneForm.jsx';
+import SceneGraph from './scenegraph.jsx';
+import SceneForm from './sceneform.jsx';
 import ValidationPanel from './ValidationPanel.jsx';
 import PlayPreview from './PlayPreview.jsx';
 
