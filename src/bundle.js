@@ -969,14 +969,59 @@ function authorText(authorId) {
   return /^\d{5,25}$/.test(String(authorId)) ? `<@${authorId}>` : '운영자';
 }
 
-// 스탯/자원/파벌/소지품 필드 만들기
+// 능력치 막대 설정: 칸 수, 위험 기준, 키별 아이콘
+const BAR_SLOTS = 5;
+const DANGER_RATIO = 0.2; // 20% 이하면 위험
+const EMPTY_ICON = '🖤';
+const BAR_ICONS = {
+  hp: { lead: '', on: '❤️' },
+  sanity: { lead: '🧠', on: '❤️' },
+};
+const NUMBER_ICONS = { money: '🪙', coin: '🪙', gold: '🪙' };
+
+// 능력치의 최소/최대 (설정에 없으면 엔진 기본 범위)
+function statRange(bucket, def) {
+  const [defMin, defMax] = DEFAULT_RANGE[bucket] ?? [0, 99];
+  return [Number.isFinite(def?.min) ? def.min : defMin, Number.isFinite(def?.max) ? def.max : defMax];
+}
+
+// 본문 맨 위 한 줄: 스탯은 5칸 막대, 자원은 숫자(범위가 10 이하인 자원만 막대)
+function statusLine(config, state) {
+  const parts = [];
+  let danger = false;
+  for (const bucket of ['stats', 'resources']) {
+    for (const [key, def] of Object.entries(config?.[bucket] ?? {})) {
+      const value = Number(readOwn(state[bucket], key, 0)) || 0;
+      const [min, max] = statRange(bucket, def);
+      const label = truncate(def.label ?? key, 20);
+      const asBar = max > min && (bucket === 'stats' || max - min <= 10);
+      if (!asBar) {
+        parts.push(NUMBER_ICONS[key] ? `${NUMBER_ICONS[key]} ${value}` : `${label} ${value}`);
+        continue;
+      }
+      const ratio = (value - min) / (max - min);
+      const filled = value <= min ? 0 : Math.min(BAR_SLOTS, Math.max(1, Math.round(ratio * BAR_SLOTS)));
+      const low = ratio <= DANGER_RATIO;
+      if (low) danger = true;
+      const icon = BAR_ICONS[key] ?? { lead: '', on: '🟩' };
+      parts.push(`${icon.lead}${icon.on.repeat(filled)}${EMPTY_ICON.repeat(BAR_SLOTS - filled)} ${label}${low ? '⚠️' : ''}`);
+    }
+  }
+  return { line: parts.join('   '), danger };
+}
+
+// 상세 보기용 필드: 전체 능력치(현재/최대), 자원, 파벌, 소지품
 function stateFields(config, state) {
   const fields = [];
   const groups = [['stats', '상태'], ['resources', '자원'], ['factions', '파벌']];
   for (const [bucket, title] of groups) {
-    const parts = Object.entries(config?.[bucket] ?? {}).map(
-      ([key, def]) => `**${truncate(def.label ?? key, 20)}** ${state[bucket]?.[key] ?? 0}`
-    );
+    const parts = Object.entries(config?.[bucket] ?? {}).map(([key, def]) => {
+      const value = readOwn(state[bucket], key, 0);
+      const [min, max] = statRange(bucket, def);
+      const showMax = bucket === 'stats' || (bucket === 'resources' && max - min <= 10);
+      const shown = showMax ? `${value}/${max}` : `${value}`;
+      return `**${truncate(def.label ?? key, 20)}** ${shown}`;
+    });
     if (parts.length > 0) fields.push({ name: title, value: truncate(parts.join(' · '), 1024), inline: false });
   }
   const items = Object.entries(state.inventory ?? {}).map(
@@ -986,25 +1031,45 @@ function stateFields(config, state) {
   return fields;
 }
 
+/** 📊 상세 버튼을 눌렀을 때 나오는 창 (누른 사람에게만 보이게 privateReply로 보낸다) */
+export function detailMessage({ story, state, config = {} }) {
+  return {
+    content: '',
+    embeds: [
+      { title: truncate(`📊 ${story.title} — 상세`, 256), color: COLORS.normal, fields: stateFields(config, state) },
+    ],
+    components: [],
+  };
+}
+
 /**
- * 장면 1개를 메시지로 만든다.
- * 버튼 custom_id = c:<스토리ID>:<턴>:<선택지번호>  (100자 제한 안에 들어간다)
+ * 장면 1개를 메시지로 만든다. (서울2033 스타일)
+ * 본문 맨 위 능력치 줄 + 본문, 아래쪽 footer = [이야기] 제목 : 장소  - 턴 -
+ * 버튼 custom_id = c:<스토리ID>:<턴>:<선택지번호>, 상세 버튼 = d:<스토리ID>:<턴>
  * 턴 번호 덕분에 예전 메시지의 버튼이나 더블클릭을 걸러낼 수 있다.
  */
 export function sceneMessage({ story, scene, state, config = {}, changes = [] }) {
   const ending = state.ending;
   const choices = getAvailableChoices(config, state, scene);
+  const shown = choices.slice(0, MAX_BUTTONS);
+  const { line, danger } = statusLine(config, state);
+
+  let body = truncate(scene.body || '(본문 없음)', 3000);
+  // 버튼 글자는 80자까지라서, 긴 선택지가 있으면 전체 문장을 본문 아래에 적는다
+  const hasLong = shown.some((choice) => String(choice.label ?? '').length > 60);
+  if (hasLong && !ending) {
+    const full = shown.map((choice, i) => `${i + 1}. ${choice.enabled ? '' : '🔒 '}${choice.label || '(선택)'}`);
+    body += `\n\n${truncate(full.join('\n'), 700)}`;
+  }
 
   const embed = {
     title: truncate(ending ? `🏁 ${ENDING_LABEL[ending.type] ?? '엔딩'}: ${ending.name}` : story.title, 256),
-    description: truncate(scene.body || '(본문 없음)', 3800),
-    color: ending ? (COLORS[ending.type] ?? COLORS.normal) : COLORS.normal,
+    description: truncate(line ? `${line}\n\n${body}` : body, 4000),
+    color: ending ? (COLORS[ending.type] ?? COLORS.normal) : danger ? COLORS.bad : COLORS.normal,
     fields: [],
     footer: {
       text: truncate(
-        [state.station ? `📍 ${state.station}` : null, `${state.turn}턴`, ending ? story.title : null]
-          .filter(Boolean)
-          .join(' · '),
+        `[이야기] ${truncate(story.title, 60)}${state.station ? ` : ${truncate(state.station, 40)}` : ''}  - ${state.turn} -`,
         2000
       ),
     },
@@ -1022,13 +1087,11 @@ export function sceneMessage({ story, scene, state, config = {}, changes = [] })
     embed.fields.push({ name: '변화', value: truncate(changeLines.join('\n'), 1024), inline: false });
   }
 
-  embed.fields.push(...stateFields(config, state));
-
-  // 잠긴 선택지의 사유
+  // 잠긴 선택지의 사유 (짧게 한 줄씩)
   const locked = choices.filter((choice) => !choice.enabled);
   if (locked.length > 0) {
-    const lines = locked.map((choice) => `🔒 ${truncate(choice.label, 40)} — ${choice.lockedReason}`);
-    embed.fields.push({ name: '잠긴 선택지', value: truncate(lines.join('\n'), 1024), inline: false });
+    const lines = locked.map((choice) => `🔒 ${truncate(choice.label, 20)} — ${truncate(choice.lockedReason, 40)}`);
+    embed.fields.push({ name: '잠김', value: truncate(lines.join('\n'), 1024), inline: false });
   }
 
   // 엔딩이면 버튼을 모두 제거
@@ -1038,19 +1101,25 @@ export function sceneMessage({ story, scene, state, config = {}, changes = [] })
     embed.description += '\n\n⚠️ 이 장면에는 선택지가 없습니다. /포기 로 나갈 수 있습니다.';
   }
 
-  const buttons = choices.slice(0, MAX_BUTTONS).map((choice) => ({
+  // 선택지 버튼은 모두 회색 (서울2033의 어두운 아래 판 느낌)
+  const buttons = shown.map((choice, i) => ({
     type: ComponentType.BUTTON,
-    style: choice.enabled ? ButtonStyle.PRIMARY : ButtonStyle.SECONDARY,
-    label: truncate(`${choice.enabled ? '' : '🔒 '}${choice.label || '(선택)'}`, 80),
+    style: ButtonStyle.SECONDARY,
+    label: truncate(`${hasLong ? `${i + 1}. ` : ''}${choice.enabled ? '' : '🔒 '}${choice.label || '(선택)'}`, 80),
     custom_id: `c:${story.id}:${state.turn}:${choice.index}`,
     disabled: !choice.enabled,
   }));
 
-  return {
-    content: '',
-    embeds: [embed],
-    components: buttons.length > 0 ? [{ type: ComponentType.ACTION_ROW, components: buttons }] : [],
-  };
+  const rows = [];
+  if (buttons.length > 0) rows.push({ type: ComponentType.ACTION_ROW, components: buttons });
+  rows.push({
+    type: ComponentType.ACTION_ROW,
+    components: [
+      { type: ComponentType.BUTTON, style: ButtonStyle.SECONDARY, label: '📊 상세', custom_id: `d:${story.id}:${state.turn}` },
+    ],
+  });
+
+  return { content: '', embeds: [embed], components: rows };
 }
 
 /** 공개 스토리 목록 (최대 5개, 각 스토리마다 시작 버튼) */
@@ -1602,6 +1671,7 @@ export async function abandonSession(userId, storyId) {
 //   c:<스토리ID>:<턴>:<번호>   선택지 선택
 //   r:<스토리ID>               이어하기
 //   x:<스토리ID>               포기
+//   d:<스토리ID>:<턴>          상세 보기 (나에게만 보임)
 // ═════════════════════════════════════════════
 
 // 스토리 ID로 허용하는 글자 (Firestore 문서 ID와 custom_id에 안전한 문자만)
@@ -1794,6 +1864,13 @@ async function handleComponent(interaction) {
         return textUpdate('진행 중인 이야기가 없습니다. /스토리목록 으로 새로 시작하세요.');
       }
       return errorReply(result.message ?? '선택을 처리하지 못했습니다.');
+    }
+
+    case 'd': {
+      // 읽기만 하는 버튼: 누른 사람 자신의 진행 상황을 나에게만 보이게 보여 준다
+      const view = await getSessionView(user.id, storyId);
+      if (!view) return errorReply('진행 중인 이야기를 찾을 수 없습니다. /스토리목록 으로 새로 시작하세요.');
+      return privateReply(detailMessage({ story: view.story, state: view.session.state, config: view.story.config }));
     }
 
     default:

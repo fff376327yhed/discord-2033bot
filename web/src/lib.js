@@ -53,6 +53,11 @@ export const api = {
   browse: (params) => request(`/browse?${params}`),
   setLike: (id, liked) => request(`/stories/${id}/like`, { method: 'PUT', body: { liked } }),
   endings: (id) => request(`/stories/${id}/endings`),
+  // 관리자 (서버가 ADMIN_DISCORD_IDS 로 다시 확인한다. 운영자가 아니면 404)
+  adminReports: (status) => request(`/admin/reports?status=${encodeURIComponent(status)}`),
+  adminResolveReport: (id, status) => request(`/admin/reports/${encodeURIComponent(id)}`, { method: 'PUT', body: { status } }),
+  adminHideStory: (id, hidden, reason) => request(`/admin/stories/${encodeURIComponent(id)}/hidden`, { method: 'PUT', body: { hidden, reason } }),
+  adminBlockUser: (userId, blocked, reason) => request(`/admin/users/${encodeURIComponent(userId)}/blocked`, { method: 'PUT', body: { blocked, reason } }),
 };
 
 /* ═════════════════════════ [2] engine ═════════════════════════ */

@@ -197,6 +197,131 @@ function BrowseStories({ user }) {
   );
 }
 
+/* ───────────────────────── 관리자 (신고 처리, 스토리 숨김, 사용자 차단) ───────────────────────── */
+
+const REASON_TEXT = { spam: '스팸/광고', offensive: '불쾌하거나 부적절한 내용', copyright: '저작권 침해', other: '기타' };
+const STATUS_TEXT = { open: '처리 전', resolved: '처리 완료', dismissed: '기각' };
+
+function formatTime(ms) {
+  return ms ? new Date(ms).toLocaleString('ko-KR') : '';
+}
+
+function AdminPanel() {
+  const [status, setStatus] = useState('open');
+  const [reports, setReports] = useState(null);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState('');              // 운영자 메모 (숨김/차단 사유)
+  const [manualStory, setManualStory] = useState(''); // 직접 처리: 스토리 ID
+  const [manualUser, setManualUser] = useState('');   // 직접 처리: 사용자 ID
+
+  // 신고 목록: 탭(처리 전/완료/기각)이 바뀔 때마다 다시 불러온다. (늦게 도착한 이전 응답은 무시)
+  useEffect(() => {
+    let cancelled = false;
+    setReports(null);
+    setError('');
+    api.adminReports(status)
+      .then((data) => !cancelled && setReports(data.reports))
+      .catch((err) => !cancelled && setError(err.message));
+    return () => { cancelled = true; };
+  }, [status]);
+
+  // 요청 1건 실행: 중복 클릭 막기 + 오류/완료 안내. 성공하면 true
+  async function run(task, doneText) {
+    if (busy) return false;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      await task();
+      setNotice(doneText);
+      return true;
+    } catch (err) {
+      setError(err.message);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function closeReport(report, next) {
+    const ok = await run(() => api.adminResolveReport(report.id, next), next === 'resolved' ? '처리 완료로 표시했습니다.' : '기각했습니다.');
+    if (ok) setReports((prev) => prev.filter((item) => item.id !== report.id));
+  }
+
+  const hideStory = (storyId, hidden) =>
+    run(() => api.adminHideStory(storyId, hidden, note.trim()), hidden ? '스토리를 숨겼습니다.' : '숨김을 해제했습니다.');
+
+  function blockUser(userId, blocked) {
+    if (blocked && !window.confirm('이 사용자를 차단할까요? 로그인이 끊기고 플레이도 막힙니다.')) return;
+    return run(() => api.adminBlockUser(userId, blocked, note.trim()), blocked ? '사용자를 차단했습니다.' : '차단을 해제했습니다.');
+  }
+
+  return (
+    <div className="story-list">
+      <div className="tabs" role="tablist" aria-label="신고 상태">
+        {Object.entries(STATUS_TEXT).map(([key, text]) => (
+          <button key={key} type="button" className={`tab ${status === key ? 'active' : ''}`} aria-current={status === key} onClick={() => setStatus(key)}>
+            {text}
+          </button>
+        ))}
+      </div>
+
+      <div className="field" style={{ margin: 0 }}>
+        <label htmlFor="admin-note">운영자 메모 (숨김/차단 사유, 100자 이하 · 선택)</label>
+        <input id="admin-note" value={note} maxLength={100} onChange={(e) => setNote(e.target.value)} placeholder="예: 광고성 스토리" />
+      </div>
+
+      {error && <p role="alert" className="validation-error" style={{ margin: 0 }}>⚠️ {error}</p>}
+      {notice && <p role="status" className="validation-ok" style={{ margin: 0 }}>✅ {notice}</p>}
+
+      {!reports && !error && <p className="muted">불러오는 중...</p>}
+      {reports && reports.length === 0 && <p className="muted">{STATUS_TEXT[status]} 신고가 없습니다.</p>}
+
+      {reports?.map((report) => (
+        <div key={report.id} className="card" style={{ marginBottom: 0 }}>
+          <div className="card-title">
+            {report.storyTitle || '(제목 없음)'} <span className="badge">{REASON_TEXT[report.reason] ?? report.reason}</span>
+          </div>
+          {report.detail && <p style={{ margin: '0 0 8px', whiteSpace: 'pre-wrap' }}>{report.detail}</p>}
+          <div className="hint" style={{ marginBottom: 10 }}>
+            신고 {formatTime(report.createdAt)} · 신고자 {report.userId} · 제작자 {report.authorId}
+            <br />
+            스토리 ID <code>{report.storyId}</code>
+          </div>
+          <div className="row" style={{ flexWrap: 'wrap' }}>
+            <button type="button" className="btn btn-small" disabled={busy} onClick={() => hideStory(report.storyId, true)}>🙈 숨기기</button>
+            <button type="button" className="btn btn-small" disabled={busy} onClick={() => hideStory(report.storyId, false)}>숨김 해제</button>
+            <button type="button" className="btn btn-small btn-danger-outline" disabled={busy} onClick={() => blockUser(report.authorId, true)}>🚫 제작자 차단</button>
+            <button type="button" className="btn btn-small" disabled={busy} onClick={() => blockUser(report.authorId, false)}>차단 해제</button>
+          </div>
+          {status === 'open' && (
+            <div className="row" style={{ marginTop: 8 }}>
+              <button type="button" className="btn btn-small btn-primary" disabled={busy} onClick={() => closeReport(report, 'resolved')}>✔ 처리 완료</button>
+              <button type="button" className="btn btn-small" disabled={busy} onClick={() => closeReport(report, 'dismissed')}>기각</button>
+            </div>
+          )}
+        </div>
+      ))}
+
+      <div className="card soft" style={{ marginBottom: 0 }}>
+        <div className="card-title">직접 처리 (ID 입력)</div>
+        <div className="row" style={{ marginBottom: 8, flexWrap: 'wrap' }}>
+          <input value={manualStory} onChange={(e) => setManualStory(e.target.value.trim())} maxLength={64} placeholder="스토리 ID" />
+          <button type="button" className="btn btn-small" disabled={busy || !manualStory} onClick={() => hideStory(manualStory, true)}>숨기기</button>
+          <button type="button" className="btn btn-small" disabled={busy || !manualStory} onClick={() => hideStory(manualStory, false)}>숨김 해제</button>
+        </div>
+        <div className="row" style={{ flexWrap: 'wrap' }}>
+          <input value={manualUser} onChange={(e) => setManualUser(e.target.value.trim())} maxLength={25} inputMode="numeric" placeholder="디스코드 사용자 ID" />
+          <button type="button" className="btn btn-small btn-danger-outline" disabled={busy || !manualUser} onClick={() => blockUser(manualUser, true)}>차단</button>
+          <button type="button" className="btn btn-small" disabled={busy || !manualUser} onClick={() => blockUser(manualUser, false)}>차단 해제</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ───────────────────────── 다크 모드 ───────────────────────── */
 
 // 저장된 선택이 없으면 null → 컴퓨터/폰의 설정을 따른다.
@@ -217,7 +342,8 @@ function systemPrefersDark() {
 
 export default function App() {
   const [user, setUser] = useState(undefined); // undefined = 확인 중, null = 비로그인
-  const [tab, setTab] = useState('mine'); // 'mine' = 내 스토리, 'browse' = 둘러보기
+  const [isAdmin, setIsAdmin] = useState(false); // 서버가 알려 준 운영자 여부 (탭을 보일지만 정한다. 진짜 권한은 서버가 확인)
+  const [tab, setTab] = useState('mine'); // 'mine' = 내 스토리, 'browse' = 둘러보기, 'admin' = 관리자
   const [storyId, setStoryId] = useState(null);
   const [theme, setTheme] = useState(readSavedTheme); // 'dark' | 'light' | null(시스템 설정 따름)
 
@@ -238,7 +364,10 @@ export default function App() {
 
   useEffect(() => {
     api.me()
-      .then((data) => setUser(data.user))
+      .then((data) => {
+        setUser(data.user);
+        setIsAdmin(Boolean(data.user && data.isAdmin));
+      })
       .catch(() => setUser(null));
   }, []);
 
@@ -251,12 +380,14 @@ export default function App() {
       await api.logout();
     } finally {
       setUser(null);
+      setIsAdmin(false);
+      setTab('mine');
       setStoryId(null);
     }
   }
 
   // 로그인 안 한 사람은 항상 '둘러보기'만 보인다.
-  const activeTab = user ? tab : 'browse';
+  const activeTab = !user ? 'browse' : tab === 'admin' && !isAdmin ? 'mine' : tab;
   const editing = Boolean(user && storyId);
 
   return (
@@ -269,6 +400,9 @@ export default function App() {
           <nav className="tabs" aria-label="메뉴">
             <button type="button" className={`tab ${activeTab === 'mine' ? 'active' : ''}`} aria-current={activeTab === 'mine'} onClick={() => setTab('mine')}>내 스토리</button>
             <button type="button" className={`tab ${activeTab === 'browse' ? 'active' : ''}`} aria-current={activeTab === 'browse'} onClick={() => setTab('browse')}>둘러보기</button>
+            {isAdmin && (
+              <button type="button" className={`tab ${activeTab === 'admin' ? 'active' : ''}`} aria-current={activeTab === 'admin'} onClick={() => setTab('admin')}>관리자</button>
+            )}
           </nav>
         )}
 
@@ -296,6 +430,8 @@ export default function App() {
         <Editor storyId={storyId} onBack={() => setStoryId(null)} />
       ) : activeTab === 'mine' ? (
         <StoryList onOpen={setStoryId} />
+      ) : activeTab === 'admin' ? (
+        <AdminPanel />
       ) : (
         <div className="browse-wrap">
           <BrowseStories user={user} />
