@@ -34,6 +34,8 @@ node scripts/cli.js preflight --prod --file .env.production.local
 | FIREBASE_SERVICE_ACCOUNT_BASE64 | 서비스 계정 JSON 을 base64 로 만든 한 줄 |
 | CRON_SECRET | 16자 이상 무작위 글자 (예약 정리용) |
 | ADMIN_DISCORD_IDS | 운영자 디스코드 숫자 ID, 여러 명이면 쉼표로 |
+| DISCORD_ALLOWED_CHANNEL_IDS | (선택) 봇을 쓸 수 있는 채널 ID, 여러 개면 쉼표로. 비우면 모든 채널 |
+| DISCORD_EPHEMERAL | (선택) `true`로 두면 봇 메시지가 본인에게만 보임. 비우면 모두에게 보임 |
 
 환경 변수를 바꾼 뒤에는 **다시 배포(Redeploy)** 해야 적용됩니다.
 

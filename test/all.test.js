@@ -52,6 +52,14 @@ import {
   REQUEST_LIMITS,
   sizeToBytes,
   checkDeployment,
+  reply,
+  privateReply,
+  errorReply,
+  handleInteraction,
+  InteractionType,
+  getAllowedChannelIds,
+  isChannelAllowed,
+  getMessageOwnerId,
 } from '../src/bundle.js';
 
 const { config } = sampleStory;
@@ -1505,5 +1513,118 @@ describe('요청 크기와 배포 점검 (7-6)', () => {
     assert.equal(run({ crons: [{ path: '/api/other', schedule: '0 18 * * *' }] }), 'warn');
     assert.equal(run({ crons: [{ path: '/api/cron/cleanup', schedule: '*/5 * * * *' }] }), 'warn');
     assert.equal(run(null), 'warn'); // 파일을 못 읽음
+  });
+});
+
+// ═════════════════════════════════════════════
+// 봇: 공개 메시지 / 채널 제한 / 버튼 주인 확인
+// ═════════════════════════════════════════════
+describe('봇 공개 메시지와 채널 제한', () => {
+  const CH_A = '111111111111111111';
+  const CH_B = '222222222222222222';
+  const ME = '333333333333333333';
+  const OTHER = '444444444444444444';
+
+  // 환경 변수를 잠깐 바꿔서 실행하고 원래대로 돌린다
+  async function withEnv(patch, fn) {
+    const before = {};
+    for (const key of Object.keys(patch)) before[key] = process.env[key];
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    try {
+      return await fn();
+    } finally {
+      for (const [key, value] of Object.entries(before)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }
+
+  test('기본은 모두에게 보이는 메시지(flags 없음), 멘션은 항상 차단', async () => {
+    await withEnv({ DISCORD_EPHEMERAL: undefined }, () => {
+      const res = reply({ content: '안녕' });
+      assert.equal(res.type, 4);
+      assert.equal(res.data.flags, undefined);
+      assert.deepEqual(res.data.allowed_mentions, { parse: [] });
+    });
+  });
+
+  test('DISCORD_EPHEMERAL=true 면 예전처럼 본인에게만 보인다', async () => {
+    await withEnv({ DISCORD_EPHEMERAL: 'true' }, () => {
+      assert.equal(reply({ content: 'x' }).data.flags, 64);
+    });
+    await withEnv({ DISCORD_EPHEMERAL: 'false' }, () => {
+      assert.equal(reply({ content: 'x' }).data.flags, undefined);
+    });
+  });
+
+  test('오류 안내는 설정과 상관없이 항상 본인에게만 보인다', async () => {
+    await withEnv({ DISCORD_EPHEMERAL: undefined }, () => {
+      assert.equal(errorReply('문제').data.flags, 64);
+      assert.equal(privateReply({ content: 'x' }).data.flags, 64);
+      assert.ok(errorReply('문제').data.content.includes('문제'));
+    });
+  });
+
+  test('허용 채널 목록: 숫자 ID만 남기고 공백/쉼표를 정리한다', () => {
+    assert.deepEqual([...getAllowedChannelIds({ DISCORD_ALLOWED_CHANNEL_IDS: ` ${CH_A} , ${CH_B},abc,, ` })], [CH_A, CH_B]);
+    assert.equal(getAllowedChannelIds({}).size, 0);
+  });
+
+  test('채널 제한: 비어 있으면 모두 허용, 있으면 그 채널(과 그 안의 스레드)만', () => {
+    const env = { DISCORD_ALLOWED_CHANNEL_IDS: CH_A };
+    assert.equal(isChannelAllowed({ channel_id: CH_B }, {}), true);
+    assert.equal(isChannelAllowed({ channel_id: CH_A }, env), true);
+    assert.equal(isChannelAllowed({ channel_id: CH_B }, env), false);
+    assert.equal(isChannelAllowed({ channel_id: '999999999999999999', channel: { parent_id: CH_A } }, env), true); // 스레드
+    assert.equal(isChannelAllowed({}, env), false); // 채널 정보를 모르면 막는다
+    // 전부 틀린 값만 적으면 제한이 없는 것으로 본다 (preflight 가 경고해 준다)
+    assert.equal(isChannelAllowed({ channel_id: CH_B }, { DISCORD_ALLOWED_CHANNEL_IDS: 'oops' }), true);
+  });
+
+  test('다른 채널의 명령어/버튼은 처리하지 않고 안내만 한다 (DB를 건드리지 않음)', async () => {
+    await withEnv({ DISCORD_ALLOWED_CHANNEL_IDS: CH_A }, async () => {
+      for (const type of [InteractionType.APPLICATION_COMMAND, InteractionType.MESSAGE_COMPONENT]) {
+        const res = await handleInteraction({ type, channel_id: CH_B, member: { user: { id: ME } }, data: { name: '스토리목록', custom_id: 's:sample-001' } });
+        assert.equal(res.data.flags, 64);
+        assert.ok(res.data.content.includes(`<#${CH_A}>`), '허용된 채널을 알려 준다');
+      }
+    });
+  });
+
+  test('메시지 주인: 새 필드, 옛 필드, 없음', () => {
+    assert.equal(getMessageOwnerId({ message: { interaction_metadata: { user: { id: ME } } } }), ME);
+    assert.equal(getMessageOwnerId({ message: { interaction: { user: { id: OTHER } } } }), OTHER);
+    assert.equal(getMessageOwnerId({ message: {} }), '');
+    assert.equal(getMessageOwnerId({}), '');
+  });
+
+  test('남의 메시지의 선택/포기 버튼은 막는다 (DB를 건드리지 않음)', async () => {
+    await withEnv({ DISCORD_ALLOWED_CHANNEL_IDS: undefined }, async () => {
+      const click = (customId) => handleInteraction({
+        type: InteractionType.MESSAGE_COMPONENT,
+        channel_id: CH_A,
+        member: { user: { id: OTHER } },                                   // 누른 사람
+        message: { interaction_metadata: { user: { id: ME } } },           // 메시지 주인
+        data: { custom_id: customId },
+      });
+      for (const id of ['c:sample-001:1:0', 'x:sample-001']) {
+        const res = await click(id);
+        assert.equal(res.data.flags, 64, id);
+        assert.ok(res.data.content.includes('다른 사람'), id);
+      }
+    });
+  });
+
+  test('점검: 채널 제한 설정 검사', () => {
+    const base = { SITE_URL: 'https://example.vercel.app' };
+    const run = (DISCORD_ALLOWED_CHANNEL_IDS) =>
+      checkDeployment({ env: { ...base, DISCORD_ALLOWED_CHANNEL_IDS }, vercelJson: null, isProduction: true }).find((r) => r.name === 'DISCORD_ALLOWED_CHANNEL_IDS').level;
+    assert.equal(run(undefined), 'ok');
+    assert.equal(run(CH_A), 'ok');
+    assert.equal(run(`${CH_A}, 오타`), 'warn');
   });
 });

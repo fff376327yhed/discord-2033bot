@@ -849,11 +849,23 @@ export const ButtonStyle = { PRIMARY: 1, SECONDARY: 2, SUCCESS: 3, DANGER: 4 };
 
 const EPHEMERAL = 64; // 이 플래그가 있으면 메시지를 누른 본인에게만 보인다
 
+// 새 메시지를 채널의 모두에게 보여 줄지 정한다. (기본: 모두에게 보임)
+// 환경 변수 DISCORD_EPHEMERAL=true 로 두면 예전처럼 "본인에게만" 보인다. (되돌리기용 스위치)
+const isEphemeral = () => String(process.env.DISCORD_EPHEMERAL ?? '').trim().toLowerCase() === 'true';
+
 // 모든 응답에 멘션 차단: 제작자가 쓴 @everyone 같은 글이 실제로 울리지 않게 한다
 const NO_MENTIONS = { parse: [] };
 
-/** 새 메시지로 응답 (본인에게만 보임) */
+/** 새 메시지로 응답 (기본: 채널의 모두에게 보임, DISCORD_EPHEMERAL=true 면 본인에게만) */
 export function reply(data) {
+  return {
+    type: ResponseType.CHANNEL_MESSAGE,
+    data: { ...data, ...(isEphemeral() ? { flags: EPHEMERAL } : {}), allowed_mentions: NO_MENTIONS },
+  };
+}
+
+/** 항상 본인에게만 보이는 새 메시지 (오류 안내처럼 채널을 어지럽히면 안 되는 글) */
+export function privateReply(data) {
   return {
     type: ResponseType.CHANNEL_MESSAGE,
     data: { ...data, flags: EPHEMERAL, allowed_mentions: NO_MENTIONS },
@@ -870,7 +882,7 @@ export function update(data) {
 
 /** 오류 안내 (본인에게만 보이는 새 메시지, 기존 메시지는 그대로 둔다) */
 export function errorReply(message) {
-  return reply({ content: `⚠️ ${message}`, embeds: [], components: [] });
+  return privateReply({ content: `⚠️ ${message}`, embeds: [], components: [] });
 }
 
 /** 기존 메시지를 글자만 남기고 교체 (임베드/버튼 제거) */
@@ -1596,8 +1608,43 @@ const START_ERRORS = {
   BLOCKED: '이용이 제한된 계정입니다.',
 };
 
+// ─────────────────────────────────────────────
+// 채널 제한 / 메시지 주인 확인
+// ─────────────────────────────────────────────
+
+/** 환경 변수 DISCORD_ALLOWED_CHANNEL_IDS(쉼표 구분)에 적힌 채널 ID 모음. 숫자 ID 형식이 아닌 것은 버린다. */
+export function getAllowedChannelIds(env = process.env) {
+  return new Set(
+    String(env.DISCORD_ALLOWED_CHANNEL_IDS ?? '')
+      .split(',')
+      .map((id) => id.trim())
+      .filter((id) => /^\d{17,20}$/.test(id))
+  );
+}
+
+/** 이 상호작용이 허용된 채널에서 왔는지. 설정이 비어 있으면 모든 채널을 허용한다. (스레드는 부모 채널 기준으로도 본다) */
+export function isChannelAllowed(interaction, env = process.env) {
+  const allowed = getAllowedChannelIds(env);
+  if (allowed.size === 0) return true;
+  const channelId = String(interaction?.channel_id ?? interaction?.channel?.id ?? '');
+  const parentId = String(interaction?.channel?.parent_id ?? '');
+  return allowed.has(channelId) || (parentId !== '' && allowed.has(parentId));
+}
+
+/** 버튼이 붙은 메시지를 처음 만든(명령어를 친) 사람의 ID. 알 수 없으면 빈 글자. */
+export function getMessageOwnerId(interaction) {
+  const message = interaction?.message;
+  return String(message?.interaction_metadata?.user?.id ?? message?.interaction?.user?.id ?? '');
+}
+
+const NOT_OWNER_MESSAGE = '이 버튼은 다른 사람이 플레이 중인 메시지예요. /스토리목록 또는 /플레이 로 직접 시작해 보세요.';
+
 /** 진입점: 상호작용 종류에 따라 나눠서 처리 */
 export async function handleInteraction(interaction) {
+  if (!isChannelAllowed(interaction)) {
+    const channels = [...getAllowedChannelIds()].map((id) => `<#${id}>`).join(' ');
+    return errorReply(`이 봇은 ${channels} 채널에서만 사용할 수 있어요.`);
+  }
   if (interaction.type === InteractionType.APPLICATION_COMMAND) return handleCommand(interaction);
   if (interaction.type === InteractionType.MESSAGE_COMPONENT) return handleComponent(interaction);
   return errorReply('지원하지 않는 요청입니다.');
@@ -1678,19 +1725,28 @@ async function handleComponent(interaction) {
   const storyId = parts[1] ?? '';
   if (!STORY_ID_PATTERN.test(storyId)) return errorReply('올바르지 않은 버튼입니다.');
 
+  // 메시지가 모두에게 보이므로, 남이 누른 버튼이 내 메시지를 바꾸지 못하게 한다.
+  //  - 시작/이어하기 버튼: 주인이 아니면 기존 메시지를 바꾸지 않고 "새 메시지"로 자기 플레이를 시작한다.
+  //  - 선택/포기 버튼: 주인이 아니면 막는다. (남의 진행을 건드릴 수 없다)
+  const ownerId = getMessageOwnerId(interaction);
+  const isOwner = ownerId === '' || ownerId === user.id; // 주인을 알 수 없으면(예전 메시지) 막지 않는다
+  const respond = isOwner ? update : reply;
+
   switch (kind) {
     case 's':
-      return startFlow(user, storyId, update);
+      return startFlow(user, storyId, respond);
 
     case 'r':
-      return resumeFlow(user, storyId, update);
+      return resumeFlow(user, storyId, respond);
 
     case 'x': {
+      if (!isOwner) return errorReply(NOT_OWNER_MESSAGE);
       const done = await abandonSession(user.id, storyId);
       return textUpdate(done ? '🏳️ 포기했습니다. /스토리목록 으로 다른 이야기를 시작해 보세요.' : '이미 끝났거나 진행 중인 이야기가 아닙니다.');
     }
 
     case 'c': {
+      if (!isOwner) return errorReply(NOT_OWNER_MESSAGE);
       const turn = Number(parts[2]);
       const index = Number(parts[3]);
       if (!Number.isInteger(turn) || !Number.isInteger(index)) return errorReply('올바르지 않은 버튼입니다.');
@@ -3417,6 +3473,13 @@ export function checkDeployment({ env = {}, vercelJson = null, isProduction = fa
   if (rawAdmins.length === 0) add('warn', 'ADMIN_DISCORD_IDS', '비어 있습니다. 운영자가 없어 신고 처리를 웹에서 할 수 없습니다. (cli 명령은 가능)');
   else if (goodAdmins.size !== rawAdmins.length) add('warn', 'ADMIN_DISCORD_IDS', '숫자 ID 형식이 아닌 항목이 있어 무시됩니다.');
   else add('ok', 'ADMIN_DISCORD_IDS', `운영자 ${goodAdmins.size}명`);
+
+  // 5-2) 봇 사용 채널 제한 (비어 있으면 모든 채널 허용)
+  const rawChannels = text('DISCORD_ALLOWED_CHANNEL_IDS').split(',').map((id) => id.trim()).filter(Boolean);
+  const goodChannels = getAllowedChannelIds(env);
+  if (rawChannels.length === 0) add('ok', 'DISCORD_ALLOWED_CHANNEL_IDS', '비어 있음 (모든 채널에서 사용 가능)');
+  else if (goodChannels.size !== rawChannels.length) add('warn', 'DISCORD_ALLOWED_CHANNEL_IDS', '숫자 ID 형식이 아닌 항목이 있어 무시됩니다. 전부 틀리면 제한 없이 동작합니다.');
+  else add('ok', 'DISCORD_ALLOWED_CHANNEL_IDS', `허용 채널 ${goodChannels.size}개`);
 
   // 6) vercel.json 의 크론
   if (!vercelJson) {
