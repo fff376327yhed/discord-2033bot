@@ -338,6 +338,81 @@ function systemPrefersDark() {
   return window.matchMedia('(prefers-color-scheme: dark)').matches;
 }
 
+/* ───────────────────────── AdminPanel (관리자) ───────────────────────── */
+
+function AdminPanel() {
+  const [status, setStatus] = useState('open');
+  const [reports, setReports] = useState(null);
+  const [error, setError] = useState(null);
+
+  function reload() {
+    setError(null);
+    setReports(null);
+    api.adminReports(status)
+      .then((data) => setReports(data.reports ?? []))
+      .catch((err) => setError(err.message));
+  }
+  useEffect(reload, [status]);
+
+  async function act(fn) {
+    try {
+      await fn();
+      reload();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  function hideStory(report) {
+    const reason = window.prompt('숨김 사유를 입력하세요');
+    if (reason === null) return;
+    act(() => api.adminHideStory(report.storyId, true, reason));
+  }
+
+  function blockUser(report) {
+    const reason = window.prompt('차단 사유를 입력하세요');
+    if (reason === null) return;
+    act(() => api.adminBlockUser(report.authorId, true, reason));
+  }
+
+  return (
+    <div className="story-list">
+      <div style={{ display: 'flex', gap: 8 }}>
+        {['open', 'resolved', 'dismissed'].map((s) => (
+          <button
+            key={s}
+            className={`btn btn-small ${status === s ? 'btn-primary' : ''}`}
+            onClick={() => setStatus(s)}
+          >
+            {{ open: '대기', resolved: '처리됨', dismissed: '기각' }[s]}
+          </button>
+        ))}
+      </div>
+
+      {error && <div>⚠️ {error}</div>}
+      {!error && !reports && <div>불러오는 중...</div>}
+      {reports?.length === 0 && <p style={{ color: 'var(--muted)' }}>신고가 없습니다.</p>}
+
+      {reports?.map((r) => (
+        <div key={r.id} className="story-row" style={{ cursor: 'default' }}>
+          <div>
+            <div>스토리 {r.storyId}</div>
+            <div className="meta">{r.reason}</div>
+            {status === 'open' && (
+              <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                <button className="btn btn-small" onClick={() => act(() => api.adminResolveReport(r.id, 'resolved'))}>처리 완료</button>
+                <button className="btn btn-small" onClick={() => act(() => api.adminResolveReport(r.id, 'dismissed'))}>기각</button>
+                <button className="btn btn-small" onClick={() => hideStory(r)}>스토리 숨기기</button>
+                <button className="btn btn-small" onClick={() => blockUser(r)}>작성자 차단</button>
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /* ───────────────────────── App ───────────────────────── */
 
 export default function App() {

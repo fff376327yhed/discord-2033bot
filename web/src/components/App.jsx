@@ -64,17 +64,105 @@ function StoryList({ onOpen }) {
   );
 }
 
+/* ───────────────────────── AdminPanel (관리자) ───────────────────────── */
+
+function AdminPanel() {
+  const [status, setStatus] = useState('open');
+  const [reports, setReports] = useState(null);
+  const [error, setError] = useState(null);
+
+  function reload() {
+    setError(null);
+    setReports(null);
+    api.adminReports(status)
+      .then((data) => setReports(data.reports ?? []))
+      .catch((err) => setError(err.message));
+  }
+  useEffect(reload, [status]);
+
+  async function act(fn) {
+    try {
+      await fn();
+      reload();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  function hideStory(report) {
+    const reason = window.prompt('숨김 사유를 입력하세요');
+    if (reason === null) return;
+    act(() => api.adminHideStory(report.storyId, true, reason));
+  }
+
+  function blockUser(report) {
+    const reason = window.prompt('차단 사유를 입력하세요');
+    if (reason === null) return;
+    act(() => api.adminBlockUser(report.authorId, true, reason));
+  }
+
+  return (
+    <div className="story-list">
+      <div style={{ display: 'flex', gap: 8 }}>
+        {['open', 'resolved', 'dismissed'].map((s) => (
+          <button
+            key={s}
+            className={`btn btn-small ${status === s ? 'btn-primary' : ''}`}
+            onClick={() => setStatus(s)}
+          >
+            {{ open: '대기', resolved: '처리됨', dismissed: '기각' }[s]}
+          </button>
+        ))}
+      </div>
+
+      {error && <div>⚠️ {error}</div>}
+      {!error && !reports && <div>불러오는 중...</div>}
+      {reports?.length === 0 && <p style={{ color: 'var(--muted)' }}>신고가 없습니다.</p>}
+
+      {reports?.map((r) => (
+        <div key={r.id} className="story-row" style={{ cursor: 'default' }}>
+          <div>
+            <div>스토리 {r.storyId}</div>
+            <div className="meta">{r.reason}</div>
+            {status === 'open' && (
+              <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                <button className="btn btn-small" onClick={() => act(() => api.adminResolveReport(r.id, 'resolved'))}>처리 완료</button>
+                <button className="btn btn-small" onClick={() => act(() => api.adminResolveReport(r.id, 'dismissed'))}>기각</button>
+                <button className="btn btn-small" onClick={() => hideStory(r)}>스토리 숨기기</button>
+                <button className="btn btn-small" onClick={() => blockUser(r)}>작성자 차단</button>
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /* ───────────────────────── App ───────────────────────── */
 
 export default function App() {
   const [user, setUser] = useState(undefined); // undefined = 확인 중, null = 비로그인
   const [storyId, setStoryId] = useState(null);
+  const [tab, setTab] = useState('stories'); // 'stories' | 'admin'
+  const [isAdmin, setIsAdmin] = useState(false);
 
   useEffect(() => {
     api.me()
       .then((data) => setUser(data.user))
       .catch(() => setUser(null));
   }, []);
+
+  // 운영자가 아니면 서버가 404를 주므로, 성공할 때만 관리자 탭을 보여준다.
+  useEffect(() => {
+    if (!user) {
+      setIsAdmin(false);
+      return;
+    }
+    api.adminReports('open')
+      .then(() => setIsAdmin(true))
+      .catch(() => setIsAdmin(false));
+  }, [user]);
 
   if (user === undefined) {
     return <div style={{ padding: 20 }}>불러오는 중...</div>;
@@ -88,6 +176,7 @@ export default function App() {
     try {
       await api.logout();
     } finally {
+      setTab('stories');
       setUser(null);
     }
   }
@@ -96,6 +185,12 @@ export default function App() {
     <div>
       <div className="topbar">
         <strong>🚇 해정2033 창작마당</strong>
+        {isAdmin && !storyId && (
+          <>
+            <button className={`btn btn-small ${tab === 'stories' ? 'btn-primary' : ''}`} onClick={() => setTab('stories')}>내 스토리</button>
+            <button className={`btn btn-small ${tab === 'admin' ? 'btn-primary' : ''}`} onClick={() => setTab('admin')}>관리자</button>
+          </>
+        )}
         <div className="spacer" />
         <span className="user">{user.username ?? user.name ?? '사용자'}</span>
         <button className="btn btn-small" onClick={handleLogout}>로그아웃</button>
@@ -103,6 +198,8 @@ export default function App() {
 
       {storyId ? (
         <Editor storyId={storyId} onBack={() => setStoryId(null)} />
+      ) : tab === 'admin' && isAdmin ? (
+        <AdminPanel />
       ) : (
         <StoryList onOpen={setStoryId} />
       )}
