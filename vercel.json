@@ -1,5 +1,8 @@
 {
   "rewrites": [
     { "source": "/api/((?!interactions).*)", "destination": "/api" }
+  ],
+  "crons": [
+    { "path": "/api/cron/cleanup", "schedule": "0 18 * * *" }
   ]
 }
