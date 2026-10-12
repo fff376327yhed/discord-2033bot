@@ -1,628 +1,14 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+// 스토리 편집 화면: 왼쪽 페이지 목록 + 가운데 장면 편집(본문, 선택지 카드)
+// 설정/유효성 검사/구조도는 모달로 열린다.
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { api } from './api.js';
-import { startStory, advance, getAvailableChoices } from './engine.js';
-import useMediaQuery from './useMediaQuery.js';
+import ConfigPanel from './ConfigPanel.jsx';
+import SceneGraph from './SceneGraph.jsx';
+import SceneForm from './SceneForm.jsx';
+import ValidationPanel from './ValidationPanel.jsx';
+import PlayPreview from './PlayPreview.jsx';
 
-// 화면이 이 폭 이하이면 "목록 모드"(모바일)로 바꾼다. styles.css 의 @media (max-width: 900px) 와 같은 숫자여야 한다.
-const MOBILE_QUERY = '(max-width: 900px)';
-
-/* ======================================================================
-   Fold — 접었다 펼 수 있는 상자(아코디언). 제목 줄을 누르면 열리고 닫힌다.
-   defaultOpen 은 "처음 나타날 때" 한 번만 읽는다.
-   ====================================================================== */
-function Fold({ title, summary, defaultOpen = false, actions, children }) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <div className="fold">
-      <div className="fold-head">
-        <button type="button" className="fold-toggle" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
-          <span aria-hidden="true">{open ? '▾' : '▸'}</span>
-          <span className="fold-title">{title}</span>
-          {summary && <span className="fold-summary">{summary}</span>}
-        </button>
-        {actions}
-      </div>
-      {open && <div className="fold-body">{children}</div>}
-    </div>
-  );
-}
-
-/* ======================================================================
-   ConfigPanel — 스토리 설정(스탯/자원/파벌/아이템/플래그/시작 소지품)
-   ====================================================================== */
-
-function BucketEditor({ title, bucket, config, setConfig, numeric }) {
-  const entries = Object.entries(config[bucket] ?? {});
-
-  function update(key, patch) {
-    setConfig((prev) => ({ ...prev, [bucket]: { ...prev[bucket], [key]: { ...prev[bucket][key], ...patch } } }));
-  }
-  function remove(key) {
-    setConfig((prev) => {
-      const next = { ...prev[bucket] };
-      delete next[key];
-      return { ...prev, [bucket]: next };
-    });
-  }
-  function add() {
-    const key = prompt(`새 ${title} 키 (영문/숫자/_/- , 예: hp)`);
-    if (!key) return;
-    if (!/^[a-zA-Z0-9_-]{1,40}$/.test(key)) { alert('영문/숫자/_/- 40자 이하만 가능합니다.'); return; }
-    if (config[bucket]?.[key]) { alert('이미 있는 키입니다.'); return; }
-    const def = numeric ? { label: key, initial: 0, min: 0, max: 100 } : { label: key };
-    setConfig((prev) => ({ ...prev, [bucket]: { ...prev[bucket], [key]: def } }));
-  }
-
-  return (
-    <div className="field">
-      <div className="panel-title" style={{ fontSize: 13 }}>
-        {title} ({entries.length})
-        <button className="btn btn-small" onClick={add}>+ 추가</button>
-      </div>
-      {entries.map(([key, def]) => (
-        <div key={key} className="list-item">
-          <div className="list-item-head">
-            <code style={{ fontSize: 11, color: 'var(--muted)' }}>{key}</code>
-            <button className="btn btn-small btn-danger" onClick={() => remove(key)}>삭제</button>
-          </div>
-          <input value={def.label ?? ''} placeholder="이름(라벨)" onChange={(e) => update(key, { label: e.target.value })} style={{ marginBottom: 6 }} />
-          {numeric && (
-            <div className="row">
-              <input type="number" value={def.initial ?? 0} placeholder="초기값" onChange={(e) => update(key, { initial: Number(e.target.value) })} />
-              <input type="number" value={def.min ?? 0} placeholder="최소" onChange={(e) => update(key, { min: Number(e.target.value) })} />
-              <input type="number" value={def.max ?? 100} placeholder="최대" onChange={(e) => update(key, { max: Number(e.target.value) })} />
-            </div>
-          )}
-          {numeric && bucket === 'stats' && (
-            <input
-              style={{ marginTop: 6 }}
-              value={def.onZero ?? ''}
-              placeholder="onZero: 0 이하가 되면 이동할 장면 키 (선택)"
-              onChange={(e) => update(key, { onZero: e.target.value || undefined })}
-            />
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function StartInventoryEditor({ config, setConfig }) {
-  const items = Object.keys(config.items ?? {});
-  if (items.length === 0) return null;
-
-  function setCount(key, count) {
-    setConfig((prev) => {
-      const next = { ...prev.startInventory };
-      if (!count || count <= 0) delete next[key]; else next[key] = count;
-      return { ...prev, startInventory: next };
-    });
-  }
-
-  return (
-    <div className="field">
-      <label>시작 소지품</label>
-      {items.map((key) => (
-        <div key={key} className="row" style={{ marginBottom: 4 }}>
-          <span style={{ flex: 2 }}>{config.items[key]?.label ?? key}</span>
-          <input type="number" min="0" max="99" value={config.startInventory?.[key] ?? 0} onChange={(e) => setCount(key, Number(e.target.value))} />
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function ConfigPanel({ meta, setMeta, config, setConfig, isPublic, onVisibility, onDelete }) {
-  const [tagInput, setTagInput] = useState('');
-
-  function addTag() {
-    const tag = tagInput.trim();
-    if (!tag) return;
-    if (meta.tags.length >= 5) { alert('태그는 최대 5개까지 가능합니다.'); return; }
-    if (meta.tags.includes(tag)) { setTagInput(''); return; }
-    setMeta((prev) => ({ ...prev, tags: [...prev.tags, tag] }));
-    setTagInput('');
-  }
-  function removeTag(tag) {
-    setMeta((prev) => ({ ...prev, tags: prev.tags.filter((t) => t !== tag) }));
-  }
-
-  return (
-    <div>
-      <div className="panel-title">스토리 설정</div>
-
-      <div className="field">
-        <label>제목</label>
-        <input value={meta.title} maxLength={50} onChange={(e) => setMeta((p) => ({ ...p, title: e.target.value }))} />
-      </div>
-      <div className="field">
-        <label>설명</label>
-        <textarea rows={3} value={meta.description} maxLength={500} onChange={(e) => setMeta((p) => ({ ...p, description: e.target.value }))} />
-      </div>
-      <div className="field">
-        <label>태그 (최대 5개)</label>
-        <div className="row">
-          <input value={tagInput} maxLength={20} onChange={(e) => setTagInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addTag()} />
-          <button className="btn btn-small" onClick={addTag} style={{ flex: '0 0 auto' }}>추가</button>
-        </div>
-        <div style={{ marginTop: 6 }}>
-          {meta.tags.map((tag) => (
-            <span key={tag} className="tag-pill" style={{ cursor: 'pointer' }} onClick={() => removeTag(tag)} title="클릭하면 삭제">{tag} ✕</span>
-          ))}
-        </div>
-      </div>
-
-      <div className="field">
-        <label>공개 상태</label>
-        <button className={`btn ${isPublic ? 'btn-primary' : ''}`} onClick={() => onVisibility(!isPublic)}>
-          {isPublic ? '✅ 공개 중 (클릭하면 비공개로)' : '🔒 비공개 (클릭하면 공개로)'}
-        </button>
-      </div>
-
-      <hr style={{ borderColor: 'var(--border)', margin: '16px 0' }} />
-
-      <BucketEditor title="스탯" bucket="stats" config={config} setConfig={setConfig} numeric />
-      <BucketEditor title="자원" bucket="resources" config={config} setConfig={setConfig} numeric />
-      <BucketEditor title="파벌" bucket="factions" config={config} setConfig={setConfig} numeric />
-      <BucketEditor title="아이템" bucket="items" config={config} setConfig={setConfig} />
-      <BucketEditor title="플래그" bucket="flags" config={config} setConfig={setConfig} />
-      <StartInventoryEditor config={config} setConfig={setConfig} />
-
-      <hr style={{ borderColor: 'var(--border)', margin: '16px 0' }} />
-      <button className="btn btn-danger" onClick={onDelete}>스토리 삭제</button>
-    </div>
-  );
-}
-
-/* ======================================================================
-   SceneGraph — 장면 노드/연결선 캔버스
-   ====================================================================== */
-
-const NODE_W = 180, NODE_H = 70;
-
-function SceneGraph({ scenes, selected, onSelect, startSceneId, onMove, onAddAt }) {
-  const canvasRef = useRef(null);
-  const [dragging, setDragging] = useState(null); // { key, offsetX, offsetY }
-
-  useEffect(() => {
-    if (!dragging) return;
-    function handleMove(e) {
-      const rect = canvasRef.current.getBoundingClientRect();
-      const x = e.clientX - rect.left + canvasRef.current.scrollLeft;
-      const y = e.clientY - rect.top + canvasRef.current.scrollTop;
-      onMove(dragging.key, Math.max(0, Math.round(x - dragging.offsetX)), Math.max(0, Math.round(y - dragging.offsetY)));
-    }
-    function handleUp() { setDragging(null); }
-    window.addEventListener('pointermove', handleMove);
-    window.addEventListener('pointerup', handleUp);
-    window.addEventListener('pointercancel', handleUp); // 터치가 중간에 끊겨도 드래그 해제
-    return () => {
-      window.removeEventListener('pointermove', handleMove);
-      window.removeEventListener('pointerup', handleUp);
-      window.removeEventListener('pointercancel', handleUp);
-    };
-  }, [dragging, onMove]);
-
-  function onPointerDown(e, key) {
-    const scene = scenes[key];
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left + canvasRef.current.scrollLeft;
-    const y = e.clientY - rect.top + canvasRef.current.scrollTop;
-    setDragging({ key, offsetX: x - (scene.posX ?? 0), offsetY: y - (scene.posY ?? 0) });
-    onSelect(key);
-    e.stopPropagation();
-  }
-
-  function onCanvasDoubleClick(e) {
-    if (!e.target.classList.contains('graph-canvas') && !e.target.classList.contains('graph-inner')) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left + canvasRef.current.scrollLeft;
-    const y = e.clientY - rect.top + canvasRef.current.scrollTop;
-    onAddAt(Math.round(x - NODE_W / 2), Math.round(y - NODE_H / 2));
-  }
-
-  const entries = Object.entries(scenes);
-  const edges = [];
-  for (const [key, scene] of entries) {
-    for (const choice of scene.choices ?? []) {
-      if (choice.to && scenes[choice.to]) edges.push({ from: key, to: choice.to });
-    }
-  }
-  const width = Math.max(1200, ...entries.map(([, s]) => (s.posX ?? 0) + NODE_W + 100), 0);
-  const height = Math.max(800, ...entries.map(([, s]) => (s.posY ?? 0) + NODE_H + 100), 0);
-
-  function center(key) {
-    const s = scenes[key];
-    return { x: (s.posX ?? 0) + NODE_W / 2, y: (s.posY ?? 0) + NODE_H / 2 };
-  }
-
-  return (
-    <div ref={canvasRef} className="graph-canvas" onDoubleClick={onCanvasDoubleClick} title="빈 곳을 더블클릭하면 그 위치에 장면이 추가됩니다">
-      <svg width={width} height={height} style={{ position: 'absolute', top: 0, left: 0, pointerEvents: 'none' }}>
-        <defs>
-          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-            <path d="M0,0 L8,4 L0,8 Z" fill="var(--border)" />
-          </marker>
-        </defs>
-        {edges.map((edge, i) => {
-          const a = center(edge.from), b = center(edge.to);
-          return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="var(--border)" strokeWidth="2" markerEnd="url(#arrow)" />;
-        })}
-      </svg>
-      <div className="graph-inner" style={{ position: 'relative', width, height }}>
-        {entries.map(([key, scene]) => (
-          <div
-            key={key}
-            className={`scene-node ${selected === key ? 'selected' : ''} ${scene.isEnding ? 'ending' : ''} ${key === startSceneId ? 'start-marker' : ''}`}
-            style={{ left: scene.posX ?? 0, top: scene.posY ?? 0 }}
-            onPointerDown={(e) => onPointerDown(e, key)}
-          >
-            <div className="title">{key === startSceneId ? '🚩 ' : ''}{scene.isEnding ? '🏁 ' : ''}{key}</div>
-            <div className="body-preview">{scene.body || '(본문 없음)'}</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-/* ======================================================================
-   SceneForm — 선택된 장면의 상세 편집 폼
-   ====================================================================== */
-
-// 아래 상수들은 src/bundle.js 의 LIMITS/MAX 를 사람이 손으로 옮겨 적은 것이다.
-// 서버 쪽 값이 바뀌면 여기도 같이 맞춰야 한다 (화면 제한은 참고용일 뿐, 최종 검증은 항상 서버가 한다).
-const LIMITS = { BODY: 1800, LABEL: 80, CHOICES: 5, STATION: 40, ENDING_NAME: 50, IMAGE_URL: 500, ENTRIES: 10 };
-const ENTRY_TYPES = ['stat', 'resource', 'faction', 'item', 'flag'];
-const COND_OPS = ['>=', '<=', '>', '<', '==', '!='];
-const ENDING_TYPES = [{ value: 'good', label: '굿' }, { value: 'bad', label: '배드' }, { value: 'hidden', label: '히든' }];
-
-function allKeysOf(config, type) {
-  if (type === 'item') return Object.entries(config.items ?? {});
-  if (type === 'flag') return Object.entries(config.flags ?? {});
-  const bucket = { stat: 'stats', resource: 'resources', faction: 'factions' }[type];
-  return Object.entries(config[bucket] ?? {});
-}
-
-function EntryRow({ entry, config, kind, onChange, onRemove }) {
-  const options = allKeysOf(config, entry.type);
-  return (
-    <div className="row entry-row" style={{ marginBottom: 4, flexWrap: 'wrap' }}>
-      <select value={entry.type} onChange={(e) => onChange({ ...entry, type: e.target.value, key: '' })}>
-        {ENTRY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-      </select>
-      <select value={entry.key ?? ''} onChange={(e) => onChange({ ...entry, key: e.target.value })}>
-        <option value="">(선택)</option>
-        {options.map(([key, def]) => <option key={key} value={key}>{def.label ?? key}</option>)}
-      </select>
-      {entry.type === 'flag' ? (
-        <select value={entry.value === false ? 'false' : 'true'} onChange={(e) => onChange({ ...entry, value: e.target.value === 'true' })}>
-          <option value="true">켜짐</option>
-          <option value="false">꺼짐</option>
-        </select>
-      ) : kind === 'condition' ? (
-        <>
-          <select value={entry.op ?? '>='} onChange={(e) => onChange({ ...entry, op: e.target.value })}>
-            {COND_OPS.map((op) => <option key={op} value={op}>{op}</option>)}
-          </select>
-          <input type="number" value={entry.value ?? 0} onChange={(e) => onChange({ ...entry, value: Number(e.target.value) })} />
-        </>
-      ) : (
-        <input type="number" placeholder="증감(delta)" value={entry.delta ?? 0} onChange={(e) => onChange({ ...entry, delta: Number(e.target.value) })} />
-      )}
-      <button className="btn btn-small btn-danger" onClick={onRemove} style={{ flex: '0 0 auto' }}>✕</button>
-    </div>
-  );
-}
-
-function EntryListEditor({ title, list, config, kind, onChange }) {
-  function update(i, entry) { const next = [...list]; next[i] = entry; onChange(next); }
-  function remove(i) { onChange(list.filter((_, idx) => idx !== i)); }
-  function add() {
-    if (list.length >= LIMITS.ENTRIES) { alert(`최대 ${LIMITS.ENTRIES}개까지 가능합니다.`); return; }
-    onChange([...list, kind === 'condition' ? { type: 'item', key: '', op: '>=', value: 1 } : { type: 'stat', key: '', delta: 0 }]);
-  }
-  return (
-    <Fold title={title} summary={`${list.length}/${LIMITS.ENTRIES}`}>
-      {list.map((entry, i) => (
-        <EntryRow key={i} entry={entry} config={config} kind={kind} onChange={(e) => update(i, e)} onRemove={() => remove(i)} />
-      ))}
-      <button className="btn btn-small" onClick={add}>+ {title} 추가</button>
-    </Fold>
-  );
-}
-
-function ChoiceEditor({ choice, index, scenes, config, defaultOpen, onChange, onRemove }) {
-  const sceneKeys = Object.keys(scenes);
-  return (
-    <div className="list-item">
-      <Fold
-        title={`선택지 ${index + 1}`}
-        summary={`${choice.label || '(문구 없음)'} → ${choice.to || '연결 안 됨'}`}
-        defaultOpen={defaultOpen}
-        actions={<button className="btn btn-small btn-danger" onClick={onRemove}>삭제</button>}
-      >
-      <div className="field">
-        <label>버튼 문구</label>
-        <input value={choice.label} maxLength={LIMITS.LABEL} onChange={(e) => onChange({ ...choice, label: e.target.value })} />
-      </div>
-      <div className="field">
-        <label>이동할 장면</label>
-        <select value={choice.to ?? ''} onChange={(e) => onChange({ ...choice, to: e.target.value })}>
-          <option value="">(연결 안 됨 — 끊긴 분기로 표시됩니다)</option>
-          {sceneKeys.map((key) => <option key={key} value={key}>{key}</option>)}
-        </select>
-      </div>
-      <EntryListEditor title="조건 (전부 만족해야 함)" list={choice.condition ?? []} config={config} kind="condition" onChange={(v) => onChange({ ...choice, condition: v })} />
-      <EntryListEditor title="효과" list={choice.effects ?? []} config={config} kind="effect" onChange={(v) => onChange({ ...choice, effects: v })} />
-      <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, marginTop: 6 }}>
-        <input type="checkbox" checked={Boolean(choice.hideWhenLocked)} onChange={(e) => onChange({ ...choice, hideWhenLocked: e.target.checked })} style={{ width: 'auto' }} />
-        조건 미달 시 선택지를 숨김 (끄면 🔒 잠금 표시로 보여줌)
-      </label>
-      </Fold>
-    </div>
-  );
-}
-
-function SceneForm({ sceneKey, scene, scenes, startSceneId, onChange, onDelete, onSetStart, config }) {
-  const choices = scene.choices ?? [];
-  const [newIndex, setNewIndex] = useState(-1); // 방금 추가한 선택지 번호 (그것만 펼쳐서 보여준다)
-
-  function updateChoice(i, choice) { const next = [...choices]; next[i] = choice; onChange({ choices: next }); }
-  function removeChoice(i) { onChange({ choices: choices.filter((_, idx) => idx !== i) }); }
-  function addChoice() {
-    if (choices.length >= LIMITS.CHOICES) { alert(`선택지는 최대 ${LIMITS.CHOICES}개까지 가능합니다.`); return; }
-    setNewIndex(choices.length);
-    onChange({ choices: [...choices, { label: '선택', to: '', condition: [], effects: [], hideWhenLocked: false }] });
-  }
-
-  return (
-    <div>
-      <div className="panel-title">
-        장면: <code>{sceneKey}</code>
-        <button className="btn btn-small btn-danger" onClick={onDelete}>삭제</button>
-      </div>
-
-      {sceneKey !== startSceneId && (
-        <button className="btn btn-small" onClick={onSetStart} style={{ marginBottom: 10 }}>🚩 이 장면을 시작 장면으로</button>
-      )}
-
-      <div className="field">
-        <label>본문 ({(scene.body ?? '').length}/{LIMITS.BODY})</label>
-        <textarea rows={6} value={scene.body ?? ''} maxLength={LIMITS.BODY} onChange={(e) => onChange({ body: e.target.value })} />
-      </div>
-      <div className="field">
-        <label>역 이름 (표시용, 선택)</label>
-        <input value={scene.station ?? ''} maxLength={LIMITS.STATION} onChange={(e) => onChange({ station: e.target.value || null })} />
-      </div>
-      <div className="field">
-        <label>이미지 주소 (https만 가능, 선택)</label>
-        <input value={scene.imageUrl ?? ''} maxLength={LIMITS.IMAGE_URL} onChange={(e) => onChange({ imageUrl: e.target.value || null })} />
-      </div>
-
-      <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
-        <input type="checkbox" checked={Boolean(scene.isEnding)} onChange={(e) => onChange({ isEnding: e.target.checked })} style={{ width: 'auto' }} />
-        이 장면은 엔딩입니다
-      </label>
-
-      {scene.isEnding ? (
-        <>
-          <div className="field">
-            <label>엔딩 이름</label>
-            <input value={scene.endingName ?? ''} maxLength={LIMITS.ENDING_NAME} onChange={(e) => onChange({ endingName: e.target.value || null })} />
-          </div>
-          <div className="field">
-            <label>엔딩 종류</label>
-            <select value={scene.endingType ?? ''} onChange={(e) => onChange({ endingType: e.target.value || null })}>
-              <option value="">(선택)</option>
-              {ENDING_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
-            </select>
-          </div>
-        </>
-      ) : (
-        <>
-          <EntryListEditor title="진입 효과 (onEnter)" list={scene.onEnter ?? []} config={config} kind="effect" onChange={(v) => onChange({ onEnter: v })} />
-          <div className="panel-title" style={{ fontSize: 13 }}>
-            선택지 ({choices.length}/{LIMITS.CHOICES})
-            <button className="btn btn-small" onClick={addChoice}>+ 선택지 추가</button>
-          </div>
-          {choices.map((choice, i) => (
-            <ChoiceEditor key={i} choice={choice} index={i} scenes={scenes} config={config} defaultOpen={i === newIndex} onChange={(c) => updateChoice(i, c)} onRemove={() => removeChoice(i)} />
-          ))}
-        </>
-      )}
-    </div>
-  );
-}
-
-/* ======================================================================
-   ValidationPanel — 유효성 검사
-   ====================================================================== */
-
-function ValidationPanel({ config, scenes, startSceneId, validation, setValidation }) {
-  const [checking, setChecking] = useState(false);
-  const [error, setError] = useState(null);
-
-  async function check() {
-    setChecking(true);
-    setError(null);
-    try {
-      const scenesToSend = {};
-      for (const [key, scene] of Object.entries(scenes)) {
-        const { id, ...rest } = scene;
-        scenesToSend[key] = rest;
-      }
-      const report = await api.validateDraft({ startSceneId, config, scenes: scenesToSend });
-      setValidation(report);
-    } catch (err) {
-      if (err.status === 400 && err.details) setError(err.details.join(' / '));
-      else setError(err.message);
-    } finally {
-      setChecking(false);
-    }
-  }
-
-  return (
-    <div style={{ marginTop: 20, borderTop: '1px solid var(--border)', paddingTop: 14 }}>
-      <div className="panel-title" style={{ fontSize: 13 }}>
-        유효성 검사
-        <button className="btn btn-small" disabled={checking} onClick={check}>{checking ? '검사 중...' : '검사하기'}</button>
-      </div>
-      {error && <div className="validation-error">⚠️ 입력값 자체에 문제가 있습니다: {error}</div>}
-      {validation && (
-        <>
-          <div className={validation.ok ? 'validation-ok' : 'validation-error'}>
-            {validation.ok ? '✅ 통과 — 공개할 수 있습니다.' : '❌ 오류가 있어 공개할 수 없습니다.'}
-          </div>
-          {validation.errors.length > 0 && (
-            <ul className="validation-list validation-error">{validation.errors.map((msg, i) => <li key={i}>{msg}</li>)}</ul>
-          )}
-          {validation.warnings.length > 0 && (
-            <ul className="validation-list validation-warn">{validation.warnings.map((msg, i) => <li key={i}>{msg}</li>)}</ul>
-          )}
-        </>
-      )}
-    </div>
-  );
-}
-
-/* ======================================================================
-   PlayPreview — 저장 전 즉시 플레이 미리보기
-   ====================================================================== */
-
-function withIds(scenes) {
-  const out = {};
-  for (const [key, scene] of Object.entries(scenes)) out[key] = { ...scene, id: key };
-  return out;
-}
-
-function PlayPreview({ config, scenes, startSceneId, storyTitle, onClose }) {
-  const scenesWithIds = withIds(scenes);
-  const loadScene = async (id) => scenesWithIds[id] ?? null;
-
-  const [state, setState] = useState(null);
-  const [scene, setScene] = useState(null);
-  const [error, setError] = useState(null);
-
-  function start() {
-    const startScene = scenesWithIds[startSceneId];
-    if (!startScene) { setError('시작 장면이 없습니다.'); return; }
-    startStory(config, startScene, loadScene).then((result) => {
-      if (!result.ok) { setError(result.message); return; }
-      setState(result.state); setScene(result.scene); setError(null);
-    });
-  }
-
-  async function pick(index) {
-    const result = await advance(config, state, scene, index, loadScene);
-    if (!result.ok) { setError(result.message); return; }
-    setState(result.state); setScene(result.scene); setError(null);
-  }
-
-  if (!state) {
-    return (
-      <div className="modal-backdrop" onClick={onClose}>
-        <div className="modal" onClick={(e) => e.stopPropagation()}>
-          <h3>▶ 미리보기: {storyTitle || '(제목 없음)'}</h3>
-          <p style={{ color: 'var(--muted)', fontSize: 13 }}>저장하지 않은 현재 편집 내용으로 바로 플레이합니다. (Firestore에 영향 없음)</p>
-          {error && <div className="validation-error">⚠️ {error}</div>}
-          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-            <button className="btn btn-primary" onClick={start}>시작</button>
-            <button className="btn" onClick={onClose}>닫기</button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const choices = getAvailableChoices(config, state, scene);
-  const statusParts = [];
-  for (const bucket of ['stats', 'resources', 'factions']) {
-    for (const [key, def] of Object.entries(config[bucket] ?? {})) {
-      statusParts.push(`${def.label ?? key} ${state[bucket][key] ?? 0}`);
-    }
-  }
-  const items = Object.entries(state.inventory).map(([key, n]) => `${config.items?.[key]?.label ?? key}×${n}`);
-
-  return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        {state.station && <div className="badge" style={{ marginBottom: 8 }}>📍 {state.station}</div>}
-        <p>{scene.body}</p>
-        <p style={{ fontSize: 12, color: 'var(--muted)' }}>{statusParts.join(' · ')}</p>
-        <p style={{ fontSize: 12, color: 'var(--muted)' }}>소지품: {items.length ? items.join(', ') : '없음'}</p>
-
-        {state.ending ? (
-          <div style={{ marginTop: 12 }}><strong>🏁 [{state.ending.type}] {state.ending.name}</strong></div>
-        ) : (
-          <div style={{ marginTop: 12 }}>
-            {choices.length === 0 && <div className="validation-warn">⚠️ 선택지가 없습니다 (막다른 길).</div>}
-            {choices.map((c) => (
-              <button key={c.index} className={`btn choice-btn ${c.enabled ? '' : 'locked'}`} disabled={!c.enabled} onClick={() => pick(c.index)} title={c.lockedReason ?? ''}>
-                {c.enabled ? '' : '🔒 '}{c.label}{c.lockedReason ? ` (${c.lockedReason})` : ''}
-              </button>
-            ))}
-          </div>
-        )}
-
-        {error && <div className="validation-error" style={{ marginTop: 10 }}>⚠️ {error}</div>}
-        <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
-          <button className="btn" onClick={start}>처음부터 다시</button>
-          <button className="btn" onClick={onClose}>닫기</button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ======================================================================
-   SceneList — 모바일용 장면 목록 (그래프 대신). 누르면 편집 화면으로 간다.
-   ====================================================================== */
-
-const ENDING_LABEL = { good: '굿', bad: '배드', hidden: '히든' };
-
-function SceneList({ scenes, startSceneId, selected, onOpen }) {
-  // 그래프에서의 위치(위→아래, 왼쪽→오른쪽) 순서로 보여준다.
-  const entries = Object.entries(scenes).sort(
-    ([, a], [, b]) => (a.posY ?? 0) - (b.posY ?? 0) || (a.posX ?? 0) - (b.posX ?? 0)
-  );
-  if (entries.length === 0) return <div className="m-empty">장면이 없습니다. '+ 장면 추가'를 눌러 만들어 보세요.</div>;
-
-  return (
-    <div className="scene-list">
-      {entries.map(([key, scene]) => {
-        const choices = scene.choices ?? [];
-        const broken = scene.isEnding ? 0 : choices.filter((c) => !c.to || !scenes[c.to]).length;
-        const deadEnd = !scene.isEnding && choices.length === 0;
-        const firstLine = (scene.body ?? '').split('\n')[0];
-        return (
-          <button
-            type="button"
-            key={key}
-            className={`scene-row ${selected === key ? 'selected' : ''} ${scene.isEnding ? 'ending' : ''} ${key === startSceneId ? 'start-marker' : ''}`}
-            onClick={() => onOpen(key)}
-          >
-            <div className="scene-row-head">
-              <span className="scene-row-title">{key === startSceneId ? '🚩 ' : ''}{scene.isEnding ? '🏁 ' : ''}{key}</span>
-              <span className="scene-row-badges">
-                {scene.isEnding
-                  ? <span className="badge">엔딩{scene.endingType ? ` · ${ENDING_LABEL[scene.endingType] ?? ''}` : ''}</span>
-                  : <span className="badge">선택지 {choices.length}</span>}
-                {broken > 0 && <span className="badge warn">끊김 {broken}</span>}
-                {deadEnd && <span className="badge warn">막다른 길</span>}
-              </span>
-            </div>
-            <div className="scene-row-body">{firstLine || '(본문 없음)'}</div>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-/* ======================================================================
-   Editor — 전체 레이아웃 (위 패널들을 조합)
-   ====================================================================== */
+const DESKTOP_QUERY = '(min-width: 901px)';
 
 let sceneCounter = 0;
 function newSceneKey(scenes) {
@@ -632,6 +18,20 @@ function newSceneKey(scenes) {
     key = `scene_${sceneCounter}`;
   } while (scenes[key]);
   return key;
+}
+
+// 사이드바에 보여 줄 한 줄 미리보기
+function previewOf(scene, key) {
+  const line = String(scene?.body ?? '').split('\n').find((l) => l.trim()) ?? '';
+  return line.trim() || `(본문 없음) ${key}`;
+}
+
+// 막다른 길이거나 끊긴 선택지가 있는 장면인가
+function hasProblem(scene, scenes) {
+  if (scene.isEnding) return false;
+  const choices = scene.choices ?? [];
+  if (choices.length === 0) return true;
+  return choices.some((c) => !c.to || !scenes[c.to]);
 }
 
 export default function Editor({ storyId, onBack }) {
@@ -648,13 +48,10 @@ export default function Editor({ storyId, onBack }) {
   const [saveMsg, setSaveMsg] = useState(null);
   const [validation, setValidation] = useState(null);
   const [preview, setPreview] = useState(false);
-  const isMobile = useMediaQuery(MOBILE_QUERY);
-  const [mobileView, setMobileView] = useState('list'); // 모바일 화면: 'list'(장면 목록) | 'edit'(장면 편집) | 'settings'(스토리 설정)
-  // 선택된 장면이 없어졌는데 편집 화면이면 목록으로 돌려보낸다.
-  const view = mobileView === 'edit' && !(selected && scenes[selected]) ? 'list' : mobileView;
-
-  // 모바일에서 화면이 바뀌면 맨 위로 올린다.
-  useEffect(() => { window.scrollTo(0, 0); }, [view, isMobile]);
+  const [panel, setPanel] = useState(null); // null | 'settings' | 'validation' | 'graph'
+  const [search, setSearch] = useState('');
+  const [sideOpen, setSideOpen] = useState(() => window.matchMedia(DESKTOP_QUERY).matches);
+  const contentRef = useRef(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -675,30 +72,56 @@ export default function Editor({ storyId, onBack }) {
 
   useEffect(load, [load]);
 
+  // 장면을 바꾸면 본문 맨 위로
+  useEffect(() => {
+    contentRef.current?.scrollTo({ top: 0 });
+  }, [selected]);
+
+  // 페이지 번호: 시작 장면이 P.0, 나머지는 키 이름 순서 (이름이 같으면 번호도 그대로라서 장면을 옮겨도 안 바뀐다)
+  const order = useMemo(() => {
+    const keys = Object.keys(scenes).sort((a, b) => a.localeCompare(b, 'ko', { numeric: true }));
+    const at = keys.indexOf(startSceneId);
+    if (at > 0) { keys.splice(at, 1); keys.unshift(startSceneId); }
+    return keys;
+  }, [scenes, startSceneId]);
+  const pageOf = useMemo(() => Object.fromEntries(order.map((key, i) => [key, i])), [order]);
+
+  const visibleKeys = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return order;
+    return order.filter((key) => key.toLowerCase().includes(q) || String(scenes[key]?.body ?? '').toLowerCase().includes(q));
+  }, [order, search, scenes]);
+
+  function closeSideOnMobile() {
+    if (!window.matchMedia(DESKTOP_QUERY).matches) setSideOpen(false);
+  }
+
+  function selectScene(key) {
+    setSelected(key);
+    closeSideOnMobile();
+  }
+
   function updateScene(key, patch) {
     setScenes((prev) => ({ ...prev, [key]: { ...prev[key], ...patch } }));
   }
 
-  function addScene(posX, posY) {
+  function addScene() {
     const key = newSceneKey(scenes);
+    const n = Object.keys(scenes).length;
     const scene = {
-      id: key, body: '새 장면', imageUrl: null, station: null, isEnding: false,
-      endingName: null, endingType: null, onEnter: [], choices: [], posX: posX ?? 0, posY: posY ?? 0,
+      id: key, body: '', imageUrl: null, station: null, isEnding: false,
+      endingName: null, endingType: null, onEnter: [], choices: [],
+      posX: (n % 4) * 260, posY: Math.floor(n / 4) * 180,
     };
     setScenes((prev) => ({ ...prev, [key]: scene }));
     setSelected(key);
-    setMobileView('edit'); // 모바일에서는 바로 편집 화면으로 (데스크톱에서는 쓰이지 않는다)
-  }
-
-  // 모바일에서 장면을 추가할 때는 겹치지 않게 격자 위치에 놓는다.
-  function addSceneMobile() {
-    const n = Object.keys(scenes).length;
-    addScene((n % 4) * 260, Math.floor(n / 4) * 180);
+    setSearch('');
+    closeSideOnMobile();
   }
 
   function deleteScene(key) {
     if (key === startSceneId) { alert('시작 장면은 삭제할 수 없습니다. 먼저 다른 장면을 시작 장면으로 바꿔주세요.'); return; }
-    if (!confirm(`'${key}' 장면을 삭제할까요? 이 장면을 가리키던 선택지는 연결이 끊어집니다.`)) return;
+    if (!confirm(`P.${pageOf[key]} '${key}' 장면을 삭제할까요? 이 장면을 가리키던 선택지는 연결이 끊어집니다.`)) return;
     setScenes((prev) => {
       const next = { ...prev };
       delete next[key];
@@ -707,8 +130,7 @@ export default function Editor({ storyId, onBack }) {
       }
       return next;
     });
-    setSelected((cur) => (cur === key ? null : cur));
-    setMobileView('list'); // 모바일: 삭제 후 목록으로
+    setSelected((cur) => (cur === key ? startSceneId : cur));
   }
 
   async function handleSave() {
@@ -760,113 +182,131 @@ export default function Editor({ storyId, onBack }) {
   if (loading) return <div style={{ padding: 20 }}>불러오는 중...</div>;
   if (error) return <div style={{ padding: 20 }}>⚠️ {error}</div>;
 
-  // ───────────── 모바일(좁은 화면): 목록 모드 ─────────────
-  if (isMobile) {
-    const saveButton = (
-      <button className="btn btn-primary" disabled={saving} onClick={handleSave}>{saving ? '저장 중...' : '저장'}</button>
-    );
-    return (
-      <div className="m-editor">
-        {view === 'list' && (
-          <>
-            <div className="m-bar">
-              <button className="btn" onClick={onBack}>← 내 스토리</button>
-              <div className="spacer" />
-              <button className="btn" onClick={() => setMobileView('settings')}>⚙ 설정</button>
-            </div>
-            <div className="m-title">
-              {meta.title || '(제목 없음)'} <span className="badge">{isPublic ? '공개' : '비공개'}</span>
-            </div>
-            <div className="m-actions">
-              <button className="btn" onClick={addSceneMobile}>+ 장면 추가</button>
-              <button className="btn" onClick={() => setPreview(true)}>▶ 미리보기</button>
-              {saveButton}
-            </div>
-            {saveMsg && <div className="m-msg">{saveMsg}</div>}
-            <SceneList scenes={scenes} startSceneId={startSceneId} selected={selected} onOpen={(key) => { setSelected(key); setMobileView('edit'); }} />
-            <div className="m-body">
-              <ValidationPanel config={config} scenes={scenes} startSceneId={startSceneId} validation={validation} setValidation={setValidation} />
-            </div>
-          </>
-        )}
+  const current = selected && scenes[selected] ? selected : null;
 
-        {view === 'edit' && (
-          <>
-            <div className="m-bar">
-              <button className="btn" onClick={() => setMobileView('list')}>← 목록</button>
-              <div className="spacer" />
-              {saveButton}
-            </div>
-            {saveMsg && <div className="m-msg">{saveMsg}</div>}
-            <div className="m-body">
-              <SceneForm
-                key={selected}
-                sceneKey={selected} scene={scenes[selected]} scenes={scenes}
-                startSceneId={startSceneId}
-                onChange={(patch) => updateScene(selected, patch)}
-                onDelete={() => deleteScene(selected)}
-                onSetStart={() => setStartSceneId(selected)}
-                config={config}
-              />
-            </div>
-          </>
-        )}
-
-        {view === 'settings' && (
-          <>
-            <div className="m-bar">
-              <button className="btn" onClick={() => setMobileView('list')}>← 목록</button>
-              <div className="spacer" />
-              {saveButton}
-            </div>
-            {saveMsg && <div className="m-msg">{saveMsg}</div>}
-            <div className="m-body">
-              <ConfigPanel meta={meta} setMeta={setMeta} config={config} setConfig={setConfig} isPublic={isPublic} onVisibility={handleVisibility} onDelete={handleDelete} />
-            </div>
-          </>
-        )}
-
-        {preview && (
-          <PlayPreview config={config} scenes={scenes} startSceneId={startSceneId} storyTitle={meta.title} onClose={() => setPreview(false)} />
-        )}
-      </div>
-    );
-  }
-
-  // ───────────── 데스크톱(넓은 화면): 3단 + 그래프 ─────────────
   return (
-    <div className="editor-layout">
-      <div className="editor-col">
-        <ConfigPanel meta={meta} setMeta={setMeta} config={config} setConfig={setConfig} isPublic={isPublic} onVisibility={handleVisibility} onDelete={handleDelete} />
-      </div>
-
-      <div className="editor-col" style={{ padding: 0, position: 'relative' }}>
-        <div style={{ position: 'sticky', top: 0, zIndex: 10, background: 'var(--panel)', padding: 10, borderBottom: '1px solid var(--border)', display: 'flex', gap: 8, alignItems: 'center' }}>
-          <button className="btn" onClick={() => addScene(40, 40)}>+ 장면 추가</button>
-          <button className="btn" onClick={() => setPreview(true)}>▶ 미리보기 플레이</button>
-          <div className="spacer" />
-          {saveMsg && <span style={{ fontSize: 12, color: 'var(--muted)' }}>{saveMsg}</span>}
-          <button className="btn btn-primary" disabled={saving} onClick={handleSave}>{saving ? '저장 중...' : '저장'}</button>
+    <div className={`ed-shell ${sideOpen ? 'side-open' : ''}`}>
+      {/* ───────── 왼쪽: 페이지 목록 ───────── */}
+      <aside className="ed-side">
+        <div className="ed-side-head">
+          <button type="button" className="ed-back" onClick={onBack} title="내 스토리로 돌아가기">
+            <span aria-hidden="true">‹</span> {meta.title || '(제목 없음)'}
+          </button>
+          <button type="button" className="icon-btn" onClick={() => setPanel('settings')} title="스토리 설정" aria-label="스토리 설정">⚙</button>
         </div>
-        <SceneGraph scenes={scenes} selected={selected} onSelect={setSelected} startSceneId={startSceneId} onMove={(key, posX, posY) => updateScene(key, { posX, posY })} onAddAt={addScene} />
-      </div>
 
-      <div className="editor-col">
-        {selected && scenes[selected] ? (
-          <SceneForm
-            key={selected}
-            sceneKey={selected} scene={scenes[selected]} scenes={scenes}
-            startSceneId={startSceneId}
-            onChange={(patch) => updateScene(selected, patch)}
-            onDelete={() => deleteScene(selected)}
-            onSetStart={() => setStartSceneId(selected)}
-            config={config}
-          />
-        ) : (
-          <div style={{ color: 'var(--muted)' }}>가운데 그래프에서 장면을 선택하거나 새로 추가하세요.</div>
-        )}
-        <ValidationPanel config={config} scenes={scenes} startSceneId={startSceneId} validation={validation} setValidation={setValidation} />
-      </div>
+        <div className="ed-side-title">
+          페이지 <span className="muted">{order.length}</span>
+        </div>
+        <input className="ed-search" placeholder="페이지 검색 (번호 키 본문)" value={search} onChange={(e) => setSearch(e.target.value)} />
+
+        <div className="ed-pages">
+          {visibleKeys.length === 0 && <div className="muted ed-pages-empty">검색 결과가 없습니다.</div>}
+          {visibleKeys.map((key) => {
+            const scene = scenes[key];
+            return (
+              <button
+                type="button" key={key}
+                className={`ed-page ${key === current ? 'active' : ''}`}
+                onClick={() => selectScene(key)}
+              >
+                <span className="ed-page-no">{pageOf[key]}</span>
+                <span className="ed-page-text">{previewOf(scene, key)}</span>
+                <span className="ed-page-badges">
+                  {key === startSceneId && <span title="시작 장면">🚩</span>}
+                  {scene.isEnding && <span title="엔딩">🏁</span>}
+                  {hasProblem(scene, scenes) && <span title="막다른 길이거나 끊긴 선택지가 있습니다">⚠️</span>}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="ed-side-foot">
+          <button type="button" onClick={() => setPanel('graph')}>🗺 구조도 보기</button>
+          <button type="button" onClick={() => setPanel('validation')}>
+            ✅ 유효성 검사
+            {validation && <span className={`dot ${validation.ok ? 'ok' : 'bad'}`} />}
+          </button>
+          <button type="button" onClick={() => setPanel('settings')}>⚙ 스토리 설정</button>
+        </div>
+      </aside>
+      <div className="ed-scrim" onClick={() => setSideOpen(false)} />
+
+      {/* ───────── 가운데: 장면 편집 ───────── */}
+      <main className="ed-main">
+        <div className="ed-toolbar">
+          <button type="button" className="icon-btn" onClick={() => setSideOpen((v) => !v)} title="페이지 목록 열기/닫기" aria-label="페이지 목록 열기/닫기">
+            {sideOpen ? '«' : '☰'}
+          </button>
+          <div className="spacer" />
+          {saveMsg && <span className="ed-msg" role="status">{saveMsg}</span>}
+          <button type="button" className="btn" onClick={() => setPreview(true)}>▶ 미리보기</button>
+          <button type="button" className="btn btn-primary" disabled={saving} onClick={handleSave}>{saving ? '저장 중...' : '저장'}</button>
+        </div>
+
+        <div className="ed-content" ref={contentRef}>
+          {current ? (
+            <SceneForm
+              key={current}
+              sceneKey={current} scene={scenes[current]} scenes={scenes}
+              order={order} pageOf={pageOf} startSceneId={startSceneId} config={config}
+              onChange={(patch) => updateScene(current, patch)}
+              onDelete={() => deleteScene(current)}
+              onSetStart={() => setStartSceneId(current)}
+              onGoto={selectScene}
+            />
+          ) : (
+            <div className="ed-empty">
+              <p>왼쪽 목록에서 페이지를 고르거나, 오른쪽 아래 <strong>+</strong> 버튼으로 새 페이지를 만드세요.</p>
+            </div>
+          )}
+        </div>
+
+        <button type="button" className="fab" onClick={addScene} title="새 페이지 추가" aria-label="새 페이지 추가">+</button>
+      </main>
+
+      {/* ───────── 모달들 ───────── */}
+      {panel && (
+        <div className="modal-backdrop" onClick={() => setPanel(null)}>
+          <div className={`modal ${panel === 'graph' ? 'wide' : ''}`} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <strong>{panel === 'settings' ? '스토리 설정' : panel === 'validation' ? '유효성 검사' : '구조도'}</strong>
+              <button type="button" className="icon-btn" onClick={() => setPanel(null)} aria-label="닫기">✕</button>
+            </div>
+
+            {panel === 'settings' && (
+              <ConfigPanel meta={meta} setMeta={setMeta} config={config} setConfig={setConfig} isPublic={isPublic} onVisibility={handleVisibility} onDelete={handleDelete} />
+            )}
+            {panel === 'validation' && (
+              <ValidationPanel config={config} scenes={scenes} startSceneId={startSceneId} validation={validation} setValidation={setValidation} />
+            )}
+            {panel === 'graph' && (
+              <>
+                <p className="muted" style={{ fontSize: 13, margin: '0 0 8px' }}>
+                  장면 카드를 끌어서 옮기고, 눌러서 선택하세요. 빈 곳을 더블클릭하면 새 페이지가 만들어집니다.
+                </p>
+                <div className="graph-wrap">
+                  <SceneGraph
+                    scenes={scenes} selected={current} onSelect={setSelected} startSceneId={startSceneId}
+                    onMove={(key, posX, posY) => updateScene(key, { posX, posY })}
+                    onAddAt={(x, y) => {
+                      const key = newSceneKey(scenes);
+                      setScenes((prev) => ({ ...prev, [key]: { id: key, body: '', imageUrl: null, station: null, isEnding: false, endingName: null, endingType: null, onEnter: [], choices: [], posX: x, posY: y } }));
+                      setSelected(key);
+                    }}
+                  />
+                </div>
+                <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
+                  <button type="button" className="btn btn-primary" onClick={() => setPanel(null)} disabled={!current}>
+                    {current ? `P.${pageOf[current]} 편집하러 가기` : '닫기'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {preview && (
         <PlayPreview config={config} scenes={scenes} startSceneId={startSceneId} storyTitle={meta.title} onClose={() => setPreview(false)} />

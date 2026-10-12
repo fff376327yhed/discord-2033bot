@@ -17,10 +17,10 @@ const ENDING_TYPE = { good: '굿', bad: '배드', hidden: '히든' };
 
 const styles = {
   bar: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 },
-  card: { border: '1px solid #444', borderRadius: 8, padding: 12, marginBottom: 10 },
+  card: { border: '1px solid var(--border)', borderRadius: 14, padding: 14, marginBottom: 10 },
   chip: (active) => ({
-    padding: '2px 10px', borderRadius: 999, border: '1px solid #666', cursor: 'pointer',
-    background: active ? '#5865f2' : 'transparent', color: 'inherit',
+    padding: '2px 10px', borderRadius: 999, border: '1px solid var(--border)', cursor: 'pointer',
+    background: active ? 'var(--accent)' : 'transparent', color: active ? '#fff' : 'inherit',
   }),
 };
 

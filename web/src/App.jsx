@@ -47,12 +47,44 @@ function StoryList({ onOpen }) {
   );
 }
 
+/* ───────────────────────── 다크 모드 ───────────────────────── */
+
+// 저장된 선택이 없으면 null → 컴퓨터/폰의 설정을 따른다.
+function readSavedTheme() {
+  try {
+    const value = localStorage.getItem('theme');
+    return value === 'dark' || value === 'light' ? value : null;
+  } catch {
+    return null; // 저장소를 못 쓰는 환경이어도 화면은 정상 동작
+  }
+}
+
+function systemPrefersDark() {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches;
+}
+
 /* ───────────────────────── App ───────────────────────── */
 
 export default function App() {
   const [user, setUser] = useState(undefined); // undefined = 확인 중, null = 비로그인
   const [tab, setTab] = useState('mine'); // 'mine' = 내 스토리, 'browse' = 둘러보기
   const [storyId, setStoryId] = useState(null);
+  const [theme, setTheme] = useState(readSavedTheme); // 'dark' | 'light' | null(시스템 설정 따름)
+
+  // <html data-theme="..."> 로 css의 다크 색상을 켜고 끈다.
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme) root.dataset.theme = theme;
+    else delete root.dataset.theme;
+  }, [theme]);
+
+  const isDark = theme ? theme === 'dark' : systemPrefersDark();
+
+  function toggleTheme() {
+    const next = isDark ? 'light' : 'dark';
+    setTheme(next);
+    try { localStorage.setItem('theme', next); } catch { /* 저장 실패해도 이번 방문에는 적용됨 */ }
+  }
 
   useEffect(() => {
     api.me()
@@ -91,6 +123,14 @@ export default function App() {
         )}
 
         <div className="spacer" />
+
+        <button
+          type="button" className="btn btn-small theme-btn" onClick={toggleTheme}
+          aria-label={isDark ? '라이트 모드로 바꾸기' : '다크 모드로 바꾸기'}
+          title={isDark ? '라이트 모드' : '다크 모드'}
+        >
+          {isDark ? '☀️' : '🌙'}
+        </button>
 
         {user ? (
           <>
