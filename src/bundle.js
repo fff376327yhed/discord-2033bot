@@ -836,6 +836,11 @@ export const COMMANDS = [
     description: '진행 중인 이야기를 포기합니다',
     type: SLASH,
   },
+  {
+    name: '스토리제작',
+    description: '웹 에디터에서 나만의 스토리를 만들 수 있는 주소를 알려줍니다',
+    type: SLASH,
+  },
 ];
 
 // ═════════════════════════════════════════════
@@ -845,10 +850,10 @@ export const COMMANDS = [
 export const InteractionType = { PING: 1, APPLICATION_COMMAND: 2, MESSAGE_COMPONENT: 3 };
 export const ResponseType = { PONG: 1, CHANNEL_MESSAGE: 4, UPDATE_MESSAGE: 7 };
 export const ComponentType = { ACTION_ROW: 1, BUTTON: 2 };
-export const ButtonStyle = { PRIMARY: 1, SECONDARY: 2, SUCCESS: 3, DANGER: 4 };
+export const ButtonStyle = { PRIMARY: 1, SECONDARY: 2, SUCCESS: 3, DANGER: 4, LINK: 5 };
 
 const EPHEMERAL = 64; // 이 플래그가 있으면 메시지를 누른 본인에게만 보인다
-const SUPPRESS_NOTIFICATIONS = 4096; // 이 플래그가 있으면 푸시/알림음 없이 조용히 올라온다 (@silent와 같음)
+const SUPPRESS_NOTIFICATIONS = 4096; // 이 플래그가 있으면 알림음/푸시 없이 조용히 올라온다 (@silent)
 
 // 새 메시지를 채널의 모두에게 보여 줄지 정한다. (기본: 모두에게 보임)
 // 환경 변수 DISCORD_EPHEMERAL=true 로 두면 예전처럼 "본인에게만" 보인다. (되돌리기용 스위치)
@@ -857,7 +862,7 @@ const isEphemeral = () => String(process.env.DISCORD_EPHEMERAL ?? '').trim().toL
 // 모든 응답에 멘션 차단: 제작자가 쓴 @everyone 같은 글이 실제로 울리지 않게 한다
 const NO_MENTIONS = { parse: [] };
 
-/** 새 메시지로 응답 (기본: 채널의 모두에게 보임 + 알림 없이 조용히) */
+/** 새 메시지로 응답 (기본: 채널의 모두에게 보임 + 알림 없이 조용히, DISCORD_EPHEMERAL=true 면 본인에게만) */
 export function reply(data) {
   const flags = SUPPRESS_NOTIFICATIONS | (isEphemeral() ? EPHEMERAL : 0);
   return {
@@ -1681,6 +1686,9 @@ async function resumeFlow(user, storyId, respond) {
   );
 }
 
+// 웹 에디터 주소 (Vercel 환경 변수 WEB_URL 로 바꿀 수 있고, 없으면 아래 기본 주소를 쓴다)
+const DEFAULT_WEB_URL = 'https://discord-2033bot.vercel.app/';
+
 async function handleCommand(interaction) {
   const user = getInteractionUser(interaction);
   if (!user.id) return errorReply('유저 정보를 확인할 수 없습니다.');
@@ -1711,6 +1719,21 @@ async function handleCommand(interaction) {
       if (sessions.length === 0) return errorReply('포기할 이야기가 없습니다.');
       // 목록의 버튼을 누르는 것이 곧 확인 절차
       return reply(sessionListMessage(sessions, 'abandon'));
+    }
+
+    case '스토리제작': {
+      // 링크 버튼은 custom_id가 없어서 눌러도 봇으로 요청이 오지 않는다. (브라우저가 바로 열린다)
+      const url = String(process.env.WEB_URL ?? '').trim() || DEFAULT_WEB_URL;
+      return reply({
+        content: '🚇 **해정2033 창작마당**에서 나만의 스토리를 만들어 보세요!\n디스코드로 로그인하면 바로 만들 수 있어요.',
+        embeds: [],
+        components: [
+          {
+            type: ComponentType.ACTION_ROW,
+            components: [{ type: ComponentType.BUTTON, style: ButtonStyle.LINK, label: '스토리 만들러 가기', url }],
+          },
+        ],
+      });
     }
 
     default:
