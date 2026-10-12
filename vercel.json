@@ -1,6 +1,6 @@
 {
   "rewrites": [
-    { "source": "/api/((?!interactions).*)", "destination": "/api" }
+    { "source": "/api/(.*)", "destination": "/api" }
   ],
   "crons": [
     { "path": "/api/cron/cleanup", "schedule": "0 18 * * *" }

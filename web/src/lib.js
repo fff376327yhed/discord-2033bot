@@ -1,6 +1,61 @@
-// src/bundle.js 의 engine 부분을 그대로 복사한 "클라이언트용 사본"이다.
-// 디스코드/Firestore를 모르는 순수 함수라서 그대로 브라우저에서 돈다.
-// ⚠️ 서버(src/bundle.js)의 엔진 로직을 고치면 이 파일도 손으로 같이 맞춰야 한다 (자동 동기화 아님).
+// 서버 통신(api) + 이야기 엔진(engine)을 한 파일로 합친 "공용 도구함".
+//
+// [1] api  — 백엔드(api/index.js, 즉 src/bundle.js의 createWebRouter)에 요청을 보내는 도우미.
+//     운영에서는 /api가 같은 Vercel 배포에 있어서 같은 출처(same-origin)이고,
+//     개발에서는 vite.config.js의 proxy가 /api를 로컬 Express 서버(3000번)로 넘겨준다.
+// [2] engine — src/bundle.js 의 engine 부분을 그대로 복사한 "클라이언트용 사본"이다.
+//     디스코드/Firestore를 모르는 순수 함수라서 그대로 브라우저에서 돈다.
+//     ⚠️ 서버(src/bundle.js)의 엔진 로직을 고치면 이 파일의 [2] 부분도 손으로 같이 맞춰야 한다.
+
+/* ═════════════════════════ [1] api ═════════════════════════ */
+
+const CSRF_HEADER = 'x-requested-with';
+const CSRF_VALUE = 'haejung'; // src/bundle.js WEB.CSRF_VALUE 와 반드시 같아야 한다
+
+async function request(path, { method = 'GET', body } = {}) {
+  const headers = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (method !== 'GET' && method !== 'HEAD') headers[CSRF_HEADER] = CSRF_VALUE;
+
+  const res = await fetch(`/api${path}`, {
+    method,
+    headers,
+    credentials: 'include',
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!res.ok) {
+    const err = new Error(data?.error || `요청 실패 (HTTP ${res.status})`);
+    err.status = res.status;
+    err.details = data?.details;
+    err.validation = data?.validation;
+    err.currentUpdatedAt = data?.currentUpdatedAt;
+    throw err;
+  }
+  return data;
+}
+
+export const api = {
+  me: () => request('/auth/me'),
+  logout: () => request('/auth/logout', { method: 'POST' }),
+  myStories: () => request('/stories/mine'),
+  createStory: (body) => request('/stories', { method: 'POST', body }),
+  getStory: (id) => request(`/stories/${id}`),
+  updateStory: (id, body) => request(`/stories/${id}`, { method: 'PUT', body }),
+  saveScenes: (id, body) => request(`/stories/${id}/scenes`, { method: 'PUT', body }),
+  validateStory: (id) => request(`/stories/${id}/validate`),
+  validateDraft: (body) => request('/validate', { method: 'POST', body }),
+  setVisibility: (id, isPublic) => request(`/stories/${id}/visibility`, { method: 'PATCH', body: { isPublic } }),
+  deleteStory: (id) => request(`/stories/${id}`, { method: 'DELETE' }),
+  // 둘러보기
+  browse: (params) => request(`/browse?${params}`),
+  setLike: (id, liked) => request(`/stories/${id}/like`, { method: 'PUT', body: { liked } }),
+  endings: (id) => request(`/stories/${id}/endings`),
+};
+
+/* ═════════════════════════ [2] engine ═════════════════════════ */
 
 export const NUMERIC_BUCKETS = { stat: 'stats', resource: 'resources', faction: 'factions' };
 export const HISTORY_MAX = 100;
