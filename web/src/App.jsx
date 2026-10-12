@@ -1,7 +1,7 @@
 // 앱 화면: 로그인 → 내 스토리 목록 → 편집기 (+ 운영자라면 관리자 탭)
 // 예전의 Login.jsx, StoryList.jsx 를 이 파일 안으로 합쳤다.
 import { useEffect, useState } from 'react';
-import { api } from '../api.js';
+import { api, avatarUrl } from '../api.js';
 import Editor from './Editor.jsx';
 
 /* ───────────────────────── Login ───────────────────────── */
@@ -74,33 +74,74 @@ const REASON_LABELS = {
   other: '기타',
 };
 
-function AdminPanel() {
+const STATUS_LABELS = {
+  open: '대기',
+  resolved: '처리됨',
+  dismissed: '기각',
+  stories: '전체 스토리',
+  hidden: '숨긴 스토리',
+  blocked: '차단한 사용자',
+};
+
+const fmt = (ms) => (ms ? new Date(ms).toLocaleString('ko-KR') : '-');
+
+// 디스코드 계정 표시: 아바타 + 이름 + (ID). 이름을 누르면 디스코드 프로필이 새 탭으로 열린다.
+// user 는 서버가 내려주는 { id, username, avatar }. users 문서가 없는 사람은 이름이 null 이라 ID만 보인다.
+function UserBadge({ user, id }) {
+  const userId = String(user?.id ?? id ?? '');
+  const name = user?.username || '(이름 모름)';
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, verticalAlign: 'middle' }}>
+      <img
+        src={avatarUrl({ id: userId, avatar: user?.avatar }, 32)}
+        alt=""
+        width={20}
+        height={20}
+        loading="lazy"
+        referrerPolicy="no-referrer"
+        style={{ borderRadius: '50%' }}
+      />
+      <a href={`https://discord.com/users/${userId}`} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>
+        {name}
+      </a>
+      <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>({userId})</span>
+    </span>
+  );
+}
+
+function AdminPanel({ onOpen }) {
   const [status, setStatus] = useState('open');
   const [reports, setReports] = useState(null);
   const [error, setError] = useState(null);
-  const [pending, setPending] = useState(null); // { kind: 'hide' | 'block', report }
+  const [pending, setPending] = useState(null); // 신고 카드의 확인창: { kind: 'hide' | 'block' | 'delete', report }
+  const [storyAction, setStoryAction] = useState(null); // 스토리 카드의 확인창: { kind: 'hide' | 'delete', story }
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
+  const [authorInput, setAuthorInput] = useState('');
+  const [authorId, setAuthorId] = useState(''); // 전체 스토리 탭에서 이 작성자만 보기
 
   function reload() {
     setError(null);
     setReports(null);
-    const request = status === 'hidden'
-      ? api.adminHiddenStories().then((data) => data.stories)
-      : status === 'blocked'
-        ? api.adminBlockedUsers().then((data) => data.users)
-        : api.adminReports(status).then((data) => data.reports);
+    const request = status === 'stories'
+      ? api.adminStories(authorId).then((data) => data.stories)
+      : status === 'hidden'
+        ? api.adminHiddenStories().then((data) => data.stories)
+        : status === 'blocked'
+          ? api.adminBlockedUsers().then((data) => data.users)
+          : api.adminReports(status).then((data) => data.reports);
     request
       .then((list) => setReports(list ?? []))
       .catch((err) => setError(err.message));
   }
-  useEffect(reload, [status]);
+  useEffect(reload, [status, authorId]);
 
   async function act(fn) {
     setBusy(true);
     try {
       await fn();
       setPending(null);
+      setStoryAction(null);
       setReason('');
       reload();
     } catch (err) {
@@ -111,17 +152,34 @@ function AdminPanel() {
   }
 
   function openConfirm(kind, report) {
+    setStoryAction(null);
     setPending({ kind, report });
     setReason('');
   }
 
-  // 숨김/차단이 성공하면 이 신고도 자동으로 '처리 완료'로 넘긴다.
+  function openStoryConfirm(kind, story) {
+    setPending(null);
+    setStoryAction({ kind, story });
+    setReason('');
+  }
+
+  // 숨김/차단/삭제가 성공하면 이 신고도 자동으로 '처리 완료'로 넘긴다.
   function confirm() {
     const { kind, report } = pending;
     act(async () => {
       if (kind === 'hide') await api.adminHideStory(report.storyId, true, reason.trim());
+      else if (kind === 'delete') await api.deleteStory(report.storyId);
       else await api.adminBlockUser(report.authorId, true, reason.trim());
       await api.adminResolveReport(report.id, 'resolved');
+    });
+  }
+
+  // 스토리 카드(전체 스토리 / 숨긴 스토리 탭)의 숨기기·삭제 확인
+  function confirmStory() {
+    const { kind, story } = storyAction;
+    act(async () => {
+      if (kind === 'delete') await api.deleteStory(story.id);
+      else await api.adminHideStory(story.id, true, reason.trim());
     });
   }
 
@@ -133,46 +191,132 @@ function AdminPanel() {
     act(() => api.adminBlockUser(user.id, false, ''));
   }
 
+  function applyAuthorFilter() {
+    const value = authorInput.trim();
+    if (value !== '' && !/^\d{5,25}$/.test(value)) {
+      setError('작성자 ID는 숫자(디스코드 사용자 ID)로 입력하세요.');
+      return;
+    }
+    setAuthorId(value);
+  }
+
+  // 전체 스토리 / 숨긴 스토리 탭에서 쓰는 스토리 카드
+  function renderStory(story) {
+    const acting = storyAction?.story.id === story.id ? storyAction : null;
+    const title = story.title || '(제목 없음)';
+    return (
+      <div key={story.id} className="story-row" style={{ cursor: 'default' }}>
+        <div style={{ width: '100%' }}>
+          <div>
+            {title}{' '}
+            <span className="badge">{story.isPublic ? '공개' : '비공개'}</span>{' '}
+            {story.hidden && <span className="badge">숨김</span>}
+          </div>
+          <div className="meta">
+            작성자 <UserBadge user={story.author} id={story.authorId} /> · 장면 {story.sceneCount}개 · 플레이 {story.playCount}회 · 수정 {fmt(story.updatedAt)}
+          </div>
+          {(story.hiddenReason || story.hiddenAt > 0) && (
+            <div className="meta">
+              숨김 {fmt(story.hiddenAt)}{story.hiddenReason && <> · 사유: {story.hiddenReason}</>}
+            </div>
+          )}
+          {!acting && (
+            <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+              <button className="btn btn-small btn-primary" disabled={busy} onClick={() => onOpen(story.id)}>편집</button>
+              {story.hidden
+                ? <button className="btn btn-small" disabled={busy} onClick={() => unhide(story)}>숨김 해제</button>
+                : <button className="btn btn-small" disabled={busy} onClick={() => openStoryConfirm('hide', story)}>숨기기</button>}
+              <button className="btn btn-small" disabled={busy} onClick={() => openStoryConfirm('delete', story)}>삭제</button>
+              {status === 'stories' && (
+                <button
+                  className="btn btn-small"
+                  disabled={busy}
+                  onClick={() => { setAuthorInput(story.authorId); setAuthorId(story.authorId); }}
+                >
+                  이 작성자 스토리만
+                </button>
+              )}
+            </div>
+          )}
+          {acting && (
+            <div style={{ marginTop: 8 }}>
+              <div>
+                {acting.kind === 'delete'
+                  ? `「${title}」을(를) 삭제합니다. 장면·플레이 기록·좋아요가 모두 지워지고 되돌릴 수 없습니다.`
+                  : `「${title}」을(를) 숨깁니다.`}
+              </div>
+              {acting.kind === 'hide' && (
+                <input
+                  value={reason}
+                  onChange={(e) => setReason(e.target.value)}
+                  placeholder="사유 (선택, 100자 이내)"
+                  maxLength={100}
+                  style={{ width: '100%', marginTop: 6 }}
+                />
+              )}
+              <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+                <button className="btn btn-small btn-primary" disabled={busy} onClick={confirmStory}>
+                  {acting.kind === 'delete' ? '삭제 확인' : '확인'}
+                </button>
+                <button className="btn btn-small" disabled={busy} onClick={() => setStoryAction(null)}>취소</button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const isStoryTab = status === 'stories' || status === 'hidden';
+  const isReportTab = status === 'open' || status === 'resolved' || status === 'dismissed';
+
   return (
     <div className="story-list">
-      <div style={{ display: 'flex', gap: 8 }}>
-        {['open', 'resolved', 'dismissed', 'hidden', 'blocked'].map((s) => (
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {Object.keys(STATUS_LABELS).map((s) => (
           <button
             key={s}
             className={`btn btn-small ${status === s ? 'btn-primary' : ''}`}
             onClick={() => setStatus(s)}
           >
-            {{ open: '대기', resolved: '처리됨', dismissed: '기각', hidden: '숨긴 스토리', blocked: '차단한 사용자' }[s]}
+            {STATUS_LABELS[s]}
           </button>
         ))}
       </div>
 
+      {status === 'stories' && (
+        <div style={{ display: 'flex', gap: 6 }}>
+          <input
+            value={authorInput}
+            onChange={(e) => setAuthorInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') applyAuthorFilter(); }}
+            placeholder="작성자 디스코드 ID로 찾기 (비우면 최근 수정순 50개)"
+            style={{ flex: 1 }}
+          />
+          <button className="btn btn-small" onClick={applyAuthorFilter}>조회</button>
+          {authorId && (
+            <button className="btn btn-small" onClick={() => { setAuthorInput(''); setAuthorId(''); }}>전체 보기</button>
+          )}
+        </div>
+      )}
+
       {error && <div>⚠️ {error}</div>}
       {!error && !reports && <div>불러오는 중...</div>}
-      {reports?.length === 0 && <p style={{ color: 'var(--muted)' }}>신고가 없습니다.</p>}
+      {reports?.length === 0 && (
+        <p style={{ color: 'var(--muted)' }}>
+          {isStoryTab ? '스토리가 없습니다.' : status === 'blocked' ? '차단한 사용자가 없습니다.' : '신고가 없습니다.'}
+        </p>
+      )}
 
-      {status === 'hidden' && reports?.map((story) => (
-        <div key={story.id} className="story-row" style={{ cursor: 'default' }}>
-          <div style={{ width: '100%' }}>
-            <div>{story.title || '(제목 없음)'}</div>
-            <div className="meta">
-              {story.hiddenReason && <>{story.hiddenReason} · </>}
-              {new Date(story.hiddenAt).toLocaleString('ko-KR')} · 작성자 {story.authorId}
-            </div>
-            <div style={{ marginTop: 8 }}>
-              <button className="btn btn-small" disabled={busy} onClick={() => unhide(story)}>숨김 해제</button>
-            </div>
-          </div>
-        </div>
-      ))}
+      {isStoryTab && reports?.map(renderStory)}
 
       {status === 'blocked' && reports?.map((u) => (
         <div key={u.id} className="story-row" style={{ cursor: 'default' }}>
           <div style={{ width: '100%' }}>
-            <div>사용자 {u.id}</div>
+            <div><UserBadge user={u} id={u.id} /></div>
             <div className="meta">
               {u.blockedReason && <>{u.blockedReason} · </>}
-              {new Date(u.blockedAt).toLocaleString('ko-KR')}
+              {fmt(u.blockedAt)}
             </div>
             <div style={{ marginTop: 8 }}>
               <button className="btn btn-small" disabled={busy} onClick={() => unblock(u)}>차단 해제</button>
@@ -181,8 +325,9 @@ function AdminPanel() {
         </div>
       ))}
 
-      {status !== 'hidden' && status !== 'blocked' && reports?.map((r) => {
+      {isReportTab && reports?.map((r) => {
         const isPending = pending?.report.id === r.id;
+        const authorName = r.author?.username || r.authorId;
         return (
           <div key={r.id} className="story-row" style={{ cursor: 'default' }}>
             <div style={{ width: '100%' }}>
@@ -190,39 +335,51 @@ function AdminPanel() {
                 {r.storyTitle || '(제목 없음)'} <span className="badge">{REASON_LABELS[r.reason] ?? r.reason}</span>
               </div>
               <div className="meta">
+                작성자 <UserBadge user={r.author} id={r.authorId} />
+              </div>
+              <div className="meta">
+                신고자 <UserBadge user={r.reporter} id={r.userId} />
+              </div>
+              <div className="meta">
                 {r.detail && <>{r.detail} · </>}
-                {new Date(r.createdAt).toLocaleString('ko-KR')} · 스토리 {r.storyId}
+                {fmt(r.createdAt)} · 스토리 {r.storyId}
               </div>
               {r.handledAt > 0 && (
                 <div className="meta">
-                  {r.status === 'dismissed' ? '기각' : '처리'} {new Date(r.handledAt).toLocaleString('ko-KR')}
+                  {r.status === 'dismissed' ? '기각' : '처리'} {fmt(r.handledAt)}
                   {r.handledBy && <> · 처리자 {r.handledBy}</>}
                 </div>
               )}
               {status === 'open' && !isPending && (
-                <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+                  <button className="btn btn-small" disabled={busy} onClick={() => onOpen(r.storyId)}>스토리 보기/편집</button>
                   <button className="btn btn-small" disabled={busy} onClick={() => act(() => api.adminResolveReport(r.id, 'resolved'))}>처리 완료</button>
                   <button className="btn btn-small" disabled={busy} onClick={() => act(() => api.adminResolveReport(r.id, 'dismissed'))}>기각</button>
                   <button className="btn btn-small" onClick={() => openConfirm('hide', r)}>스토리 숨기기</button>
+                  <button className="btn btn-small" onClick={() => openConfirm('delete', r)}>스토리 삭제</button>
                   <button className="btn btn-small" onClick={() => openConfirm('block', r)}>작성자 차단</button>
                 </div>
               )}
               {isPending && (
                 <div style={{ marginTop: 8 }}>
                   <div>
-                    {pending.kind === 'hide'
-                      ? `「${r.storyTitle || r.storyId}」을(를) 숨깁니다.`
-                      : `작성자 ${r.authorId}을(를) 차단합니다.`}
+                    {pending.kind === 'hide' && `「${r.storyTitle || r.storyId}」을(를) 숨깁니다.`}
+                    {pending.kind === 'delete' && `「${r.storyTitle || r.storyId}」을(를) 삭제합니다. 장면·플레이 기록·좋아요가 모두 지워지고 되돌릴 수 없습니다.`}
+                    {pending.kind === 'block' && `작성자 ${authorName}(${r.authorId})을(를) 차단합니다.`}
                   </div>
-                  <input
-                    value={reason}
-                    onChange={(e) => setReason(e.target.value)}
-                    placeholder="사유 (선택, 100자 이내)"
-                    maxLength={100}
-                    style={{ width: '100%', marginTop: 6 }}
-                  />
+                  {pending.kind !== 'delete' && (
+                    <input
+                      value={reason}
+                      onChange={(e) => setReason(e.target.value)}
+                      placeholder="사유 (선택, 100자 이내)"
+                      maxLength={100}
+                      style={{ width: '100%', marginTop: 6 }}
+                    />
+                  )}
                   <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
-                    <button className="btn btn-small btn-primary" disabled={busy} onClick={confirm}>확인</button>
+                    <button className="btn btn-small btn-primary" disabled={busy} onClick={confirm}>
+                      {pending.kind === 'delete' ? '삭제 확인' : '확인'}
+                    </button>
                     <button className="btn btn-small" disabled={busy} onClick={() => setPending(null)}>취소</button>
                   </div>
                 </div>
@@ -288,7 +445,7 @@ export default function App() {
       {storyId ? (
         <Editor storyId={storyId} onBack={() => setStoryId(null)} />
       ) : tab === 'admin' && isAdmin ? (
-        <AdminPanel />
+        <AdminPanel onOpen={setStoryId} />
       ) : (
         <StoryList onOpen={setStoryId} />
       )}

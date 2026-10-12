@@ -1473,6 +1473,24 @@ export async function getUserNames(userIds) {
   return new Map(snaps.filter((snap) => snap.exists).map((snap) => [snap.id, snap.get('username')]));
 }
 
+/** 디스코드 프로필 조회 (users 문서). 운영자 화면에서 "이 ID가 누구인지" 보여 주는 용도. 없는 사람은 맵에 안 들어간다 */
+export async function getUserProfiles(userIds) {
+  const ids = [...new Set(userIds)].filter((id) => /^\d{5,25}$/.test(String(id)));
+  if (ids.length === 0) return new Map();
+  const db = getDb();
+  const snaps = await db.getAll(...ids.map((id) => db.collection(COL.USERS).doc(id)));
+  return new Map(
+    snaps
+      .filter((snap) => snap.exists)
+      .map((snap) => [snap.id, { id: snap.id, username: snap.get('username') ?? null, avatar: snap.get('avatar') ?? null }])
+  );
+}
+
+/** getUserProfiles 결과에서 한 명을 꺼낸다. users 문서가 없어도 ID는 항상 돌려준다. */
+export function profileOf(profiles, id) {
+  return profiles.get(String(id)) ?? { id: String(id ?? ''), username: null, avatar: null };
+}
+
 /**
  * 스토리 1개의 엔딩 도감. 못 본 엔딩의 이름/종류는 스포일러라서 내려주지 않고 "개수"만 알려준다.
  * 스토리가 없거나 볼 권한이 없으면 null
@@ -2418,7 +2436,8 @@ async function readOwned(reader, storyId, userId, { withScenes = 'never' } = {})
   const snap = await reader.get(ref);
   if (!snap.exists) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
   const data = snap.data();
-  if (data.authorId !== userId) {
+  // 운영자(ADMIN_DISCORD_IDS)는 남의 스토리도 수정/삭제할 수 있다. (관리자 화면의 "편집"/"삭제")
+  if (data.authorId !== userId && !isAdminId(userId)) {
     // 비공개 스토리는 존재 자체를 숨기고(404), 공개 스토리는 "권한 없음"(403)
     throw data.isPublic ? new HttpError(403, '본인이 만든 스토리만 수정할 수 있습니다.') : new HttpError(404, '스토리를 찾을 수 없습니다.');
   }
@@ -3116,7 +3135,7 @@ export function createWebRouter({
       const snap = await storyRef(id).get();
       if (!snap.exists) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
       const data = snap.data();
-      const isAuthor = req.user?.id === data.authorId;
+      const isAuthor = req.user?.id === data.authorId || (req.user ? isAdminId(req.user.id) : false); // 운영자는 편집기로 열 수 있다
       if ((!data.isPublic || data.hidden === true) && !isAuthor) throw new HttpError(404, '스토리를 찾을 수 없습니다.'); // 7-4: 숨김도 "없음"
 
       if (!isAuthor) return res.json({ story: summarize(id, data) }); // 스포일러/설정 노출 방지
@@ -3273,10 +3292,10 @@ export function createWebRouter({
       const taskRef = db.collection(COL.CLEANUP_TASKS).doc(id);
 
       await db.runTransaction(async (tx) => {
-        const { ref, sceneRefs } = await readOwned(tx, id, req.user.id, { withScenes: 'always' });
+        const { ref, story, sceneRefs } = await readOwned(tx, id, req.user.id, { withScenes: 'always' });
         sceneRefs.forEach((sceneRef) => tx.delete(sceneRef));
         tx.delete(ref);
-        tx.set(taskRef, { storyId: id, authorId: req.user.id, createdAt: Date.now() }); // 정리 쪽지
+        tx.set(taskRef, { storyId: id, authorId: story.authorId, createdAt: Date.now() }); // 정리 쪽지
       });
 
       let complete = false;
@@ -3432,7 +3451,11 @@ export function createWebRouter({
     wrap(async (req, res) => {
       const status = typeof req.query.status === 'string' ? req.query.status : 'open';
       if (!MODERATION.STATUSES.includes(status)) throw new HttpError(400, 'status 값이 올바르지 않습니다.');
-      res.json({ reports: await listReports(getDb(), { status }) });
+      const reports = await listReports(getDb(), { status });
+      const profiles = await getUserProfiles(reports.flatMap((r) => [r.authorId, r.userId]));
+      res.json({
+        reports: reports.map((r) => ({ ...r, author: profileOf(profiles, r.authorId), reporter: profileOf(profiles, r.userId) })),
+      });
     })
   );
 
@@ -3491,6 +3514,61 @@ export function createWebRouter({
 
       await sessionStore.setBlocked(userId, body.blocked, { reason });
       res.json({ ok: true, blocked: body.blocked });
+    })
+  );
+
+  // 전체 스토리 목록 (운영자용). 비공개/숨김 스토리도 보인다.
+  // ?authorId=디스코드ID 를 주면 그 사람의 스토리만, 없으면 최근 수정순 50개.
+  router.get(
+    '/api/admin/stories',
+    requireAdmin,
+    wrap(async (req, res) => {
+      const authorId = typeof req.query.authorId === 'string' ? req.query.authorId.trim() : '';
+      if (authorId && !DISCORD_ID_PATTERN.test(authorId)) throw new HttpError(400, '올바르지 않은 사용자 ID입니다.');
+      const col = getDb().collection(COL.STORIES);
+      const snap = authorId
+        ? await col.where('authorId', '==', authorId).limit(MODERATION.LIST_MAX).get()
+        : await col.orderBy('updatedAt', 'desc').limit(MODERATION.LIST_MAX).get();
+      const list = snap.docs.map((doc) => summarize(doc.id, doc.data())).sort((a, b) => b.updatedAt - a.updatedAt);
+      const profiles = await getUserProfiles(list.map((s) => s.authorId));
+      res.json({ stories: list.map((s) => ({ ...s, author: profileOf(profiles, s.authorId) })) });
+    })
+  );
+
+  // 운영자가 숨긴 스토리 목록
+  router.get(
+    '/api/admin/hidden-stories',
+    requireAdmin,
+    wrap(async (req, res) => {
+      const snap = await getDb().collection(COL.STORIES).where('hidden', '==', true).limit(MODERATION.LIST_MAX).get();
+      const list = snap.docs
+        .map((doc) => ({
+          ...summarize(doc.id, doc.data()),
+          hiddenAt: Number(doc.get('hiddenAt')) || 0,
+          hiddenReason: String(doc.get('hiddenReason') ?? ''),
+        }))
+        .sort((a, b) => b.hiddenAt - a.hiddenAt);
+      const profiles = await getUserProfiles(list.map((s) => s.authorId));
+      res.json({ stories: list.map((s) => ({ ...s, author: profileOf(profiles, s.authorId) })) });
+    })
+  );
+
+  // 차단한 사용자 목록 (users 문서에 저장된 디스코드 이름/아바타 포함)
+  router.get(
+    '/api/admin/blocked-users',
+    requireAdmin,
+    wrap(async (req, res) => {
+      const snap = await getDb().collection(COL.USERS).where('blocked', '==', true).limit(MODERATION.LIST_MAX).get();
+      const users = snap.docs
+        .map((doc) => ({
+          id: doc.id,
+          username: doc.get('username') ?? null,
+          avatar: doc.get('avatar') ?? null,
+          blockedAt: Number(doc.get('blockedAt')) || 0,
+          blockedReason: String(doc.get('blockedReason') ?? ''),
+        }))
+        .sort((a, b) => b.blockedAt - a.blockedAt);
+      res.json({ users });
     })
   );
 

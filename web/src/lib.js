@@ -58,7 +58,24 @@ export const api = {
   adminResolveReport: (id, status) => request(`/admin/reports/${encodeURIComponent(id)}`, { method: 'PUT', body: { status } }),
   adminHideStory: (id, hidden, reason) => request(`/admin/stories/${encodeURIComponent(id)}/hidden`, { method: 'PUT', body: { hidden, reason } }),
   adminBlockUser: (userId, blocked, reason) => request(`/admin/users/${encodeURIComponent(userId)}/blocked`, { method: 'PUT', body: { blocked, reason } }),
+  // 관리자: 전체 스토리(작성자 ID로 좁힐 수 있음) / 숨긴 스토리 / 차단한 사용자. 응답에 디스코드 프로필(author)이 들어 있다.
+  // 남의 스토리 편집/삭제는 일반 getStory/updateStory/saveScenes/deleteStory 를 그대로 쓴다. (서버가 운영자는 통과시킨다)
+  adminStories: (authorId) => request(`/admin/stories${authorId ? `?authorId=${encodeURIComponent(authorId)}` : ''}`),
+  adminHiddenStories: () => request('/admin/hidden-stories'),
+  adminBlockedUsers: () => request('/admin/blocked-users'),
 };
+
+/** 디스코드 아바타 주소. 아바타가 없으면 디스코드 기본 아바타를 쓴다. */
+export function avatarUrl(user, size = 64) {
+  const id = String(user?.id ?? '');
+  const validId = /^\d{5,25}$/.test(id);
+  if (user?.avatar && validId && /^[A-Za-z0-9_]+$/.test(user.avatar)) {
+    const ext = user.avatar.startsWith('a_') ? 'gif' : 'png';
+    return `https://cdn.discordapp.com/avatars/${id}/${user.avatar}.${ext}?size=${size}`;
+  }
+  const index = validId ? Number((BigInt(id) >> 22n) % 6n) : 0;
+  return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
+}
 
 /* ═════════════════════════ [2] engine ═════════════════════════ */
 
