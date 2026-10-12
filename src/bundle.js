@@ -848,6 +848,7 @@ export const ComponentType = { ACTION_ROW: 1, BUTTON: 2 };
 export const ButtonStyle = { PRIMARY: 1, SECONDARY: 2, SUCCESS: 3, DANGER: 4 };
 
 const EPHEMERAL = 64; // 이 플래그가 있으면 메시지를 누른 본인에게만 보인다
+const SUPPRESS_NOTIFICATIONS = 4096; // 이 플래그가 있으면 푸시/알림음 없이 조용히 올라온다 (@silent와 같음)
 
 // 새 메시지를 채널의 모두에게 보여 줄지 정한다. (기본: 모두에게 보임)
 // 환경 변수 DISCORD_EPHEMERAL=true 로 두면 예전처럼 "본인에게만" 보인다. (되돌리기용 스위치)
@@ -856,11 +857,12 @@ const isEphemeral = () => String(process.env.DISCORD_EPHEMERAL ?? '').trim().toL
 // 모든 응답에 멘션 차단: 제작자가 쓴 @everyone 같은 글이 실제로 울리지 않게 한다
 const NO_MENTIONS = { parse: [] };
 
-/** 새 메시지로 응답 (기본: 채널의 모두에게 보임, DISCORD_EPHEMERAL=true 면 본인에게만) */
+/** 새 메시지로 응답 (기본: 채널의 모두에게 보임 + 알림 없이 조용히) */
 export function reply(data) {
+  const flags = SUPPRESS_NOTIFICATIONS | (isEphemeral() ? EPHEMERAL : 0);
   return {
     type: ResponseType.CHANNEL_MESSAGE,
-    data: { ...data, ...(isEphemeral() ? { flags: EPHEMERAL } : {}), allowed_mentions: NO_MENTIONS },
+    data: { ...data, flags, allowed_mentions: NO_MENTIONS },
   };
 }
 
