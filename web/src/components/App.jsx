@@ -66,6 +66,13 @@ function StoryList({ onOpen }) {
 
 /* ───────────────────────── AdminPanel (관리자) ───────────────────────── */
 
+const REASON_LABELS = {
+  spam: '스팸/광고',
+  offensive: '불쾌하거나 부적절한 내용',
+  copyright: '저작권 침해',
+  other: '기타',
+};
+
 function AdminPanel() {
   const [status, setStatus] = useState('open');
   const [reports, setReports] = useState(null);
