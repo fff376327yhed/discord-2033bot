@@ -5,6 +5,15 @@
 //   play      터미널에서 샘플 스토리 플레이
 //   register  디스코드 슬래시 커맨드 등록
 //   seed      샘플 스토리를 Firestore에 업로드
+//   cleanup   삭제된 스토리의 남은 기록(세션/엔딩 도감/좋아요)과 만료된 속도제한 카운터 정리 (7-3)
+//   reports   처리 전 신고 목록 보기 (7-4)            예) node scripts/cli.js reports
+//   resolve   신고 처리 표시 (7-4)                    예) node scripts/cli.js resolve <신고ID> resolved|dismissed
+//   hide      스토리 숨기기 (7-4)                     예) node scripts/cli.js hide <스토리ID> [사유]
+//   unhide    스토리 숨김 해제 (7-4)                  예) node scripts/cli.js unhide <스토리ID>
+//   block     사용자 차단 (7-4, 로그인 끊김)           예) node scripts/cli.js block <디스코드유저ID> [사유]
+//   unblock   사용자 차단 해제 (7-4)                  예) node scripts/cli.js unblock <디스코드유저ID>
+//   reindex   이미 있는 스토리에 검색 열쇠(titleKey, tagKeys) 채우기 (7-5)   예) node scripts/cli.js reindex [--dry]
+//   preflight 배포 전 점검 (7-6)                      예) node scripts/cli.js preflight [--prod] [--file 경로]
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -169,7 +178,7 @@ async function register() {
 async function seed() {
   const { getDb } = await import('../src/bundle.js');
   const { COL } = await import('../src/bundle.js');
-  const { sampleStory } = await import('../src/bundle.js');
+  const { sampleStory, searchKeys } = await import('../src/bundle.js');
 
   const db = getDb();
   const storyRef = db.collection(COL.STORIES).doc(sampleStory.id);
@@ -182,6 +191,7 @@ async function seed() {
     title: sampleStory.title,
     description: sampleStory.description,
     tags: sampleStory.tags,
+    ...searchKeys(sampleStory.title, sampleStory.tags), // 7-5: 검색용 열쇠
     isPublic: true,
     startSceneId: sampleStory.startSceneId,
     config: sampleStory.config,
@@ -208,13 +218,146 @@ async function seed() {
 }
 
 // ─────────────────────────────────────────────
+// cleanup: 삭제된 스토리의 남은 기록 정리 (7-3)
+// 서버의 예약 작업(GET /api/cron/cleanup)과 같은 일을 내 PC에서 직접 한다. 여러 번 실행해도 안전하다.
+// 내 PC에서는 시간 제한이 느슨해서 55초 동안 일한다.
+// ─────────────────────────────────────────────
+async function cleanup() {
+  const { getDb, runCleanup } = await import('../src/bundle.js');
+
+  const result = await runCleanup(getDb(), { budgetMs: 55_000 });
+  console.log(`✅ 정리 끝낸 스토리: ${result.tasksDone}개`);
+  console.log(`   아직 남은 스토리: ${result.tasksLeft}개${result.tasksLeft > 0 ? ' (한 번 더 실행하세요)' : ''}`);
+  console.log(`   지운 만료 속도제한 카운터: ${result.rateLimitsDeleted}개${result.rateLimitsDone ? '' : ' (더 남았을 수 있음, 한 번 더 실행하세요)'}`);
+}
+
+// ─────────────────────────────────────────────
+// 7-4 운영 명령: 신고 보기 / 숨김 / 차단
+// 웹의 /api/admin/... 과 같은 함수를 쓴다. 내 PC에서 .env의 Firestore 키로 직접 실행하므로 따로 로그인은 필요 없다.
+// 주의: 서버(Vercel)의 둘러보기 목록 캐시는 최대 60초 뒤에 반영된다.
+// ─────────────────────────────────────────────
+const STORY_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const USER_ID_RE = /^\d{5,25}$/;
+const CLI_ADMIN = 'cli'; // 기록에 남는 "처리한 사람" 이름
+
+async function reports() {
+  const { getDb, listReports, MODERATION } = await import('../src/bundle.js');
+  const list = await listReports(getDb(), { status: 'open' });
+  if (list.length === 0) return console.log('✅ 처리할 신고가 없습니다.');
+  console.log(`처리 전 신고 ${list.length}건 (최신순)\n`);
+  for (const r of list) {
+    console.log(`• 신고ID: ${r.id}`);
+    console.log(`  스토리: ${r.storyTitle} (${r.storyId})  작성자: ${r.authorId}`);
+    console.log(`  사유: ${MODERATION.REASONS[r.reason] ?? r.reason}  신고자: ${r.userId}  시각: ${new Date(r.createdAt).toLocaleString('ko-KR')}`);
+    if (r.detail) console.log(`  설명: ${r.detail}`);
+    console.log('');
+  }
+}
+
+async function resolve() {
+  const { getDb, resolveReport } = await import('../src/bundle.js');
+  const [, , , reportId, status] = process.argv;
+  const result = await resolveReport(getDb(), reportId, status, CLI_ADMIN);
+  if (!result.ok) {
+    console.error(`❌ 실패(${result.code}). 사용법: node scripts/cli.js resolve <신고ID> resolved|dismissed`);
+    process.exit(1);
+  }
+  console.log(`✅ 신고를 ${status === 'resolved' ? '처리 완료' : '기각'}로 표시했습니다.`);
+}
+
+async function setHidden(hidden) {
+  const { getDb, setStoryHidden, clearPublicCache, MODERATION } = await import('../src/bundle.js');
+  const storyId = process.argv[3];
+  const reason = process.argv.slice(4).join(' ').slice(0, MODERATION.NOTE_MAX);
+  if (typeof storyId !== 'string' || !STORY_ID_RE.test(storyId)) {
+    console.error(`❌ 스토리 ID가 필요합니다. 사용법: node scripts/cli.js ${hidden ? 'hide' : 'unhide'} <스토리ID>${hidden ? ' [사유]' : ''}`);
+    process.exit(1);
+  }
+  const result = await setStoryHidden(getDb(), storyId, hidden, { adminId: CLI_ADMIN, reason });
+  if (!result.ok) {
+    console.error('❌ 스토리를 찾을 수 없습니다.');
+    process.exit(1);
+  }
+  clearPublicCache();
+  console.log(hidden ? `🙈 숨겼습니다: ${storyId}` : `👀 숨김을 해제했습니다: ${storyId}`);
+}
+
+async function setBlocked(blocked) {
+  const { createFirestoreSessionStore, MODERATION } = await import('../src/bundle.js');
+  const userId = process.argv[3];
+  const reason = process.argv.slice(4).join(' ').slice(0, MODERATION.NOTE_MAX);
+  if (typeof userId !== 'string' || !USER_ID_RE.test(userId)) {
+    console.error(`❌ 디스코드 유저 ID(숫자)가 필요합니다. 사용법: node scripts/cli.js ${blocked ? 'block' : 'unblock'} <유저ID>${blocked ? ' [사유]' : ''}`);
+    process.exit(1);
+  }
+  await createFirestoreSessionStore().setBlocked(userId, blocked, { reason });
+  console.log(blocked ? `⛔ 차단했습니다(로그인이 끊기고 다시 로그인할 수 없습니다): ${userId}` : `✅ 차단을 해제했습니다: ${userId}`);
+}
+
+// ─────────────────────────────────────────────
+// reindex: 검색 열쇠 채우기 (7-5)
+// ─────────────────────────────────────────────
+async function reindex() {
+  const { getDb, reindexSearchKeys } = await import('../src/bundle.js');
+  const dryRun = process.argv.includes('--dry');
+  const { total, updated } = await reindexSearchKeys(getDb(), { dryRun });
+  console.log(dryRun ? `🔎 (연습) 전체 ${total}개 중 ${updated}개를 고쳐야 합니다. 실제로 고치려면 --dry 를 빼고 다시 실행하세요.` : `✅ 전체 ${total}개 중 ${updated}개에 검색 열쇠를 채웠습니다.`);
+}
+
+// ─────────────────────────────────────────────
+// preflight: 배포 전 점검 (7-6)
+//   기본: 내 PC의 .env 를 점검 (개발용 값이라 일부는 경고가 정상)
+//   --file <경로>: 그 파일의 값을 점검 (예: vercel env pull 로 받은 운영 값)
+//   --prod: 운영 기준(https, localhost 금지, CRON_SECRET 필수)으로 엄격하게 점검
+// ─────────────────────────────────────────────
+async function preflight() {
+  const fs = await import('node:fs');
+  const { default: dotenv } = await import('dotenv');
+  const { checkDeployment } = await import('../src/bundle.js'); // 이 import 에서 .env 가 process.env 로 로드됨
+
+  const args = process.argv.slice(3);
+  const isProduction = args.includes('--prod');
+  const fileIndex = args.indexOf('--file');
+  let env = process.env;
+  if (fileIndex >= 0) {
+    const file = args[fileIndex + 1];
+    if (!file || !fs.existsSync(file)) {
+      console.error('❌ --file 뒤에 실제 파일 경로를 적어 주세요. 예) --file .env.production.local');
+      process.exit(1);
+    }
+    env = dotenv.parse(fs.readFileSync(file)); // 파일 안의 값만 점검한다 (process.env 와 섞지 않는다)
+  }
+
+  let vercelJson = null;
+  try {
+    vercelJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../vercel.json'), 'utf8'));
+  } catch {
+    vercelJson = null;
+  }
+
+  const results = checkDeployment({ env, vercelJson, isProduction });
+  const icon = { ok: '✅', warn: '⚠️ ', error: '❌' };
+  for (const r of results) console.log(`${icon[r.level]} ${r.name}: ${r.message}`);
+
+  const errors = results.filter((r) => r.level === 'error').length;
+  const warns = results.filter((r) => r.level === 'warn').length;
+  console.log(`\n결과: 오류 ${errors}개, 경고 ${warns}개 (${isProduction ? '운영 기준' : '개발 기준'})`);
+  if (errors > 0) process.exit(1);
+}
+
+const hide = () => setHidden(true);
+const unhide = () => setHidden(false);
+const block = () => setBlocked(true);
+const unblock = () => setBlocked(false);
+
+// ─────────────────────────────────────────────
 // 진입점
 // ─────────────────────────────────────────────
-const COMMANDS_MAP = { check, dev, play, register, seed };
+const COMMANDS_MAP = { check, dev, play, register, seed, cleanup, reports, resolve, hide, unhide, block, unblock, reindex, preflight };
 const name = process.argv[2];
 
 if (!COMMANDS_MAP[name]) {
-  console.log('사용법: node scripts/cli.js <check | dev | play | register | seed>');
+  console.log('사용법: node scripts/cli.js <check | dev | play | register | seed | cleanup | reports | resolve | hide | unhide | block | unblock | reindex | preflight>');
   process.exit(name ? 1 : 0);
 }
 

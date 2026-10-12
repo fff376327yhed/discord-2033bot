@@ -4,7 +4,7 @@
 import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { getDb, createWebRouter } from '../src/bundle.js';
+import { getDb, createWebRouter, REQUEST_LIMITS } from '../src/bundle.js';
 
 const app = express();
 
@@ -15,11 +15,12 @@ app.set('trust proxy', 1);
 app.use(helmet());
 
 // 요청 본문 크기 제한 (너무 큰 데이터로 서버를 괴롭히는 것을 방지)
-// 기본은 200KB, 장면 전체 저장(PUT /api/stories/:id/scenes)만 1.5MB까지 허용한다.
+// 기본은 200KB, 장면 전체 저장(PUT /api/stories/:id/scenes)만 1.5MB까지 허용한다. (숫자는 REQUEST_LIMITS)
 // 한글은 글자당 3바이트라서 장면이 많은 스토리는 200KB를 넘을 수 있다.
-// 참고: Vercel 함수 자체의 요청 크기 한도(약 4.5MB로 알고 있음)는 확인이 필요하다.
-const smallJson = express.json({ limit: '200kb' });
-const largeJson = express.json({ limit: '1.5mb' });
+// 참고: Vercel 함수 자체의 요청 크기 한도는 4.5MB(공식 문서 확인함). 이를 넘는 요청은 플랫폼이 먼저 413으로 막는다.
+// 한도 숫자는 src/bundle.js 의 REQUEST_LIMITS 한 곳에서 관리한다. (테스트가 Vercel 한도보다 작은지 검사함)
+const smallJson = express.json({ limit: REQUEST_LIMITS.DEFAULT });
+const largeJson = express.json({ limit: REQUEST_LIMITS.SCENE_SAVE });
 app.use((req, res, next) => {
   const isSceneSave = req.method === 'PUT' && /^\/api\/stories\/[^/]+\/scenes\/?$/.test(req.path);
   return (isSceneSave ? largeJson : smallJson)(req, res, next);

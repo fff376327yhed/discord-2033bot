@@ -1,5 +1,5 @@
 // 통합 테스트 (엔진 + 메시지 만들기 + 서명 검증 + 4단계 웹 API). 실행: npm test
-import { test, describe, before, after } from 'node:test';
+import { test, describe, before, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign, createHmac } from 'node:crypto';
 import express from 'express';
@@ -26,6 +26,32 @@ import {
   isTokenRevoked,
   filterPublicStories,
   WEB,
+  COL,
+  CLEANUP,
+  MODERATION,
+  getAdminIds,
+  isAdminId,
+  isHiddenFrom,
+  reportStory,
+  setStoryHidden,
+  listReports,
+  resolveReport,
+  deleteByStoryId,
+  cleanupStoryRecords,
+  deleteExpiredRateLimits,
+  runCleanup,
+  isCronAuthorized,
+  BROWSE,
+  searchKeys,
+  planPublicSearch,
+  buildSliceQuery,
+  loadPublicSlice,
+  mergePublicStories,
+  reindexSearchKeys,
+  clearPublicCache,
+  REQUEST_LIMITS,
+  sizeToBytes,
+  checkDeployment,
 } from '../src/bundle.js';
 
 const { config } = sampleStory;
@@ -808,5 +834,676 @@ describe('공유 속도제한 저장소', () => {
     } finally {
       await Promise.all([a, b].map(({ server }) => new Promise((resolve) => server.close(resolve))));
     }
+  });
+});
+
+// ═════════════════════════════════════════════
+// 삭제 후 일괄 정리 (7-3)
+// ═════════════════════════════════════════════
+// Firestore 대신 쓰는 가짜 DB: where('==' 또는 '<') / orderBy / limit / batch.delete / doc.delete 만 흉내 낸다.
+// batch 하나에 500개를 넘기면 진짜 Firestore처럼 오류를 낸다.
+function createFakeDb(seed = {}) {
+  const data = new Map(); // 컬렉션 이름 → Map(문서 ID → 내용)
+  for (const [name, docs] of Object.entries(seed)) data.set(name, new Map(Object.entries(docs)));
+  const col = (name) => {
+    if (!data.has(name)) data.set(name, new Map());
+    return data.get(name);
+  };
+  const refOf = (name, id) => ({
+    id,
+    name,
+    get: async () => snapOf(name, id),
+    delete: async () => { col(name).delete(id); },
+    update: async (fields) => {
+      if (!col(name).has(id)) throw new Error('NOT_FOUND');
+      Object.assign(col(name).get(id), fields); // FieldValue.increment 같은 값은 그대로 들어간다 (숫자 계산은 흉내 내지 않음)
+    },
+    create: async (fields) => {
+      if (col(name).has(id)) throw Object.assign(new Error('ALREADY_EXISTS'), { code: 6 });
+      col(name).set(id, { ...fields });
+    },
+  });
+  const snapOf = (name, id) => {
+    const content = col(name).get(id);
+    return { id, ref: refOf(name, id), exists: content !== undefined, data: () => content, get: (field) => content?.[field] };
+  };
+  const query = (name, filters = [], order = null, max = Infinity) => ({
+    where: (field, op, value) => query(name, [...filters, { field, op, value }], order, max),
+    orderBy: (field) => query(name, filters, field, max),
+    limit: (n) => query(name, filters, order, n),
+    select: () => query(name, filters, order, max), // 7-5: 필드 고르기는 흉내만 낸다
+    get: async () => {
+      let rows = [...col(name).entries()].filter(([, content]) =>
+        filters.every(({ field, op, value }) => (op === '==' ? content[field] === value : content[field] < value)));
+      if (order) rows.sort((a, b) => a[1][order] - b[1][order]);
+      rows = rows.slice(0, max);
+      const docs = rows.map(([id]) => snapOf(name, id));
+      return { docs, size: docs.length, empty: docs.length === 0 };
+    },
+  });
+  return {
+    collection: (name) => ({ ...query(name), doc: (id) => refOf(name, id) }),
+    batch: () => {
+      const refs = [];
+      return {
+        delete: (ref) => refs.push(ref),
+        commit: async () => {
+          assert.ok(refs.length <= 500, `배치 한도 초과: ${refs.length}`);
+          refs.forEach((ref) => col(ref.name).delete(ref.id));
+        },
+      };
+    },
+    size: (name) => col(name).size,
+    has: (name, id) => col(name).has(id),
+  };
+}
+
+// n개의 기록 문서를 만든다: { 'u0_story': { storyId }, ... }
+const records = (storyId, n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`u${i}_${storyId}`, { storyId }]));
+
+describe('삭제 후 일괄 정리 (7-3)', () => {
+  test('deleteByStoryId: 400개 배치가 넘는 1000건도 다 지우고, 다른 스토리 기록은 건드리지 않는다', async () => {
+    const db = createFakeDb({ [COL.SESSIONS]: { ...records('A', 1000), ...records('B', 3) } });
+    assert.equal(await deleteByStoryId(db, COL.SESSIONS, 'A', { budgetMs: 60_000 }), true);
+    assert.equal(db.size(COL.SESSIONS), 3);
+  });
+
+  test('deleteByStoryId: 기록이 없으면 바로 true', async () => {
+    assert.equal(await deleteByStoryId(createFakeDb(), COL.SESSIONS, 'A'), true);
+  });
+
+  test('deleteByStoryId: 시간 예산을 넘기면 멈추고 false, 다시 부르면 이어서 끝낸다', async () => {
+    const db = createFakeDb({ [COL.SESSIONS]: records('A', 1500) });
+    let t = 0;
+    const clock = () => (t += 1000); // 부를 때마다 1초씩 흐르는 가짜 시계
+    // 예산 2.5초: 400개씩 3번 지우고(1200개) 시간이 끝난다
+    assert.equal(await deleteByStoryId(db, COL.SESSIONS, 'A', { budgetMs: 2500, now: clock }), false);
+    assert.equal(db.size(COL.SESSIONS), 300);
+    assert.equal(await deleteByStoryId(db, COL.SESSIONS, 'A', { budgetMs: 60_000 }), true);
+    assert.equal(db.size(COL.SESSIONS), 0);
+  });
+
+  test('cleanupStoryRecords: 세션/엔딩 도감/좋아요를 모두 지운다', async () => {
+    const db = createFakeDb({
+      [COL.SESSIONS]: records('A', 5),
+      [COL.ENDINGS]: records('A', 5),
+      [COL.LIKES]: { ...records('A', 5), ...records('B', 2) },
+    });
+    assert.equal(await cleanupStoryRecords(db, 'A', { budgetMs: 60_000 }), true);
+    assert.equal(db.size(COL.SESSIONS), 0);
+    assert.equal(db.size(COL.ENDINGS), 0);
+    assert.equal(db.size(COL.LIKES), 2); // B의 좋아요는 그대로
+  });
+
+  test('deleteExpiredRateLimits: 만료된 카운터만 지운다', async () => {
+    const db = createFakeDb({
+      [COL.RATE_LIMITS]: {
+        old1: { count: 3, expireAt: new Date(1000) },
+        old2: { count: 1, expireAt: new Date(2000) },
+        fresh: { count: 1, expireAt: new Date(Date.now() + 120_000) },
+      },
+    });
+    const result = await deleteExpiredRateLimits(db, { budgetMs: 60_000 });
+    assert.deepEqual(result, { deleted: 2, done: true });
+    assert.equal(db.has(COL.RATE_LIMITS, 'fresh'), true);
+    assert.equal(db.size(COL.RATE_LIMITS), 1);
+  });
+
+  test('runCleanup: 쪽지가 있는 스토리의 기록만 지우고 쪽지도 버린다 (쪽지 없는 스토리는 건드리지 않는다)', async () => {
+    const db = createFakeDb({
+      [COL.CLEANUP_TASKS]: {
+        A: { storyId: 'A', createdAt: 1 },
+        B: { storyId: 'B', createdAt: 2 },
+      },
+      [COL.SESSIONS]: { ...records('A', 900), ...records('B', 10), ...records('C', 10) },
+      [COL.ENDINGS]: records('A', 4),
+      [COL.LIKES]: records('B', 4),
+      [COL.RATE_LIMITS]: { old: { count: 1, expireAt: new Date(1000) }, fresh: { count: 1, expireAt: new Date(Date.now() + 120_000) } },
+    });
+    const result = await runCleanup(db, { budgetMs: 60_000 });
+    assert.deepEqual(result, { tasksDone: 2, tasksLeft: 0, rateLimitsDeleted: 1, rateLimitsDone: true });
+    assert.equal(db.size(COL.CLEANUP_TASKS), 0);
+    assert.equal(db.size(COL.SESSIONS), 10); // C만 남는다
+    assert.equal(db.size(COL.ENDINGS), 0);
+    assert.equal(db.size(COL.LIKES), 0);
+    assert.equal(db.has(COL.RATE_LIMITS, 'fresh'), true);
+  });
+
+  test('runCleanup: 시간이 모자라면 쪽지를 남기고, 다음 실행에서 이어서 끝낸다', async () => {
+    const db = createFakeDb({
+      [COL.CLEANUP_TASKS]: { A: { storyId: 'A', createdAt: 1 } },
+      [COL.SESSIONS]: records('A', 1500),
+    });
+    let t = 0;
+    const clock = () => (t += 1000);
+    const first = await runCleanup(db, { budgetMs: 2500, now: clock });
+    assert.equal(first.tasksDone, 0);
+    assert.equal(first.tasksLeft, 1);
+    assert.equal(db.has(COL.CLEANUP_TASKS, 'A'), true); // 쪽지는 그대로
+    assert.ok(db.size(COL.SESSIONS) > 0 && db.size(COL.SESSIONS) < 1500, '일부만 지워져야 한다');
+
+    const second = await runCleanup(db, { budgetMs: 60_000 });
+    assert.equal(second.tasksDone, 1);
+    assert.equal(db.size(COL.SESSIONS), 0);
+    assert.equal(db.size(COL.CLEANUP_TASKS), 0);
+  });
+
+  test('runCleanup: 쪽지에 storyId 필드가 없으면 문서 ID를 쓴다', async () => {
+    const db = createFakeDb({ [COL.CLEANUP_TASKS]: { A: { createdAt: 1 } }, [COL.SESSIONS]: records('A', 3) });
+    await runCleanup(db, { budgetMs: 60_000 });
+    assert.equal(db.size(COL.SESSIONS), 0);
+  });
+
+  test('isCronAuthorized: 비밀이 짧거나 없으면 항상 거절, 정확히 맞아야 통과', () => {
+    const secret = 'a'.repeat(CLEANUP.CRON_SECRET_MIN);
+    assert.equal(isCronAuthorized(`Bearer ${secret}`, secret), true);
+    assert.equal(isCronAuthorized(`Bearer ${secret}x`, secret), false);
+    assert.equal(isCronAuthorized(secret, secret), false); // Bearer 빠짐
+    assert.equal(isCronAuthorized(undefined, secret), false);
+    assert.equal(isCronAuthorized('Bearer short', 'short'), false); // 비밀이 너무 짧음
+    assert.equal(isCronAuthorized('Bearer undefined', undefined), false);
+  });
+
+  describe('GET /api/cron/cleanup (HTTP)', () => {
+    let server;
+    let base;
+    let calls;
+    const saved = process.env.CRON_SECRET;
+    const SECRET = 'test-cron-secret-1234567890';
+
+    before(async () => {
+      calls = [];
+      const app = express();
+      app.use(createWebRouter({
+        sessionStore: createMemorySessionStore(),
+        rateLimitBackend: createMemoryRateLimitBackend(),
+        cleanupRunner: async (options) => { calls.push(options); return { tasksDone: 1, tasksLeft: 0, rateLimitsDeleted: 2, rateLimitsDone: true }; },
+      }));
+      await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
+      base = `http://127.0.0.1:${server.address().port}`;
+    });
+
+    after(async () => {
+      if (saved === undefined) delete process.env.CRON_SECRET; else process.env.CRON_SECRET = saved;
+      await new Promise((resolve) => server.close(resolve));
+    });
+
+    test('CRON_SECRET이 없거나 짧으면 503 (아무도 못 부른다)', async () => {
+      delete process.env.CRON_SECRET;
+      assert.equal((await fetch(`${base}/api/cron/cleanup`)).status, 503);
+      process.env.CRON_SECRET = 'short';
+      assert.equal((await fetch(`${base}/api/cron/cleanup`, { headers: { Authorization: 'Bearer short' } })).status, 503);
+      assert.equal(calls.length, 0);
+    });
+
+    test('헤더가 없거나 틀리면 401, 맞으면 200과 결과', async () => {
+      process.env.CRON_SECRET = SECRET;
+      assert.equal((await fetch(`${base}/api/cron/cleanup`)).status, 401);
+      assert.equal((await fetch(`${base}/api/cron/cleanup`, { headers: { Authorization: 'Bearer wrong-secret-value-0000' } })).status, 401);
+      assert.equal(calls.length, 0);
+
+      const ok = await fetch(`${base}/api/cron/cleanup`, { headers: { Authorization: `Bearer ${SECRET}` } });
+      assert.equal(ok.status, 200);
+      assert.deepEqual(await ok.json(), { ok: true, tasksDone: 1, tasksLeft: 0, rateLimitsDeleted: 2, rateLimitsDone: true });
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].budgetMs, CLEANUP.CRON_BUDGET_MS);
+    });
+  });
+});
+
+// ═════════════════════════════════════════════
+// 신고 / 숨김 / 사용자 차단 (7-4)
+// ═════════════════════════════════════════════
+describe('신고/숨김/차단 (7-4)', () => {
+  const ADMIN_ID = '444444444444444444';
+  const TARGET_ID = '555555555555555555';
+  const READER_ID = '666666666666666666';
+  const stories = () => ({
+    pub: { authorId: '111111111111111111', title: '공개글', isPublic: true },
+    priv: { authorId: '111111111111111111', title: '비공개글', isPublic: false },
+    hid: { authorId: '111111111111111111', title: '숨김글', isPublic: true, hidden: true },
+  });
+
+  test('운영자 목록: 숫자 ID만 인정하고, 비어 있으면 아무도 운영자가 아니다', () => {
+    const env = { ADMIN_DISCORD_IDS: ` ${ADMIN_ID}, abc ,${TARGET_ID},, 12 ` };
+    assert.deepEqual([...getAdminIds(env)], [ADMIN_ID, TARGET_ID]);
+    assert.equal(isAdminId(ADMIN_ID, env), true);
+    assert.equal(isAdminId('abc', env), false);
+    assert.equal(isAdminId(ADMIN_ID, {}), false);
+    assert.equal(isAdminId(undefined, env), false);
+  });
+
+  test('isHiddenFrom: 숨긴 스토리는 제작자 본인에게만 보인다', () => {
+    const story = { authorId: 'A', hidden: true };
+    assert.equal(isHiddenFrom(story, 'B'), true);
+    assert.equal(isHiddenFrom(story, 'A'), false);
+    assert.equal(isHiddenFrom({ authorId: 'A' }, 'B'), false);
+    assert.equal(isHiddenFrom(null, 'B'), false);
+  });
+
+  test('둘러보기: 숨긴 스토리는 목록, 검색, 태그 집계에서 빠진다', () => {
+    const all = [
+      { id: '1', title: '보임', tags: ['a'], createdAt: 2 },
+      { id: '2', title: '숨김', tags: ['secret'], hidden: true, createdAt: 1 },
+    ];
+    const result = filterPublicStories(all, {});
+    assert.deepEqual(result.stories.map((x) => x.id), ['1']);
+    assert.equal(result.total, 1);
+    assert.deepEqual(result.tags.map((x) => x.tag), ['a']);
+    assert.equal(filterPublicStories(all, { q: '숨김' }).total, 0);
+  });
+
+  test('reportStory: 신고가 저장되고, 같은 사람의 두 번째 신고는 already', async () => {
+    const db = createFakeDb({ [COL.STORIES]: stories() });
+    const first = await reportStory(db, READER_ID, 'pub', { reason: 'spam', detail: '광고예요' }, 1000);
+    assert.deepEqual(first, { ok: true, already: false });
+    const saved = await db.collection(COL.REPORTS).doc(`${READER_ID}_pub`).get();
+    assert.equal(saved.get('status'), 'open');
+    assert.equal(saved.get('reason'), 'spam');
+    assert.equal(saved.get('storyTitle'), '공개글');
+    assert.equal(saved.get('authorId'), '111111111111111111');
+
+    const second = await reportStory(db, READER_ID, 'pub', { reason: 'other' });
+    assert.deepEqual(second, { ok: true, already: true });
+    assert.equal(db.size(COL.REPORTS), 1);
+    assert.equal(saved.get('reason'), 'spam'); // 처음 신고가 그대로
+  });
+
+  test('reportStory: 내 스토리는 OWN_STORY, 없는/비공개/숨김 스토리는 모두 NO_STORY', async () => {
+    const db = createFakeDb({ [COL.STORIES]: stories() });
+    assert.equal((await reportStory(db, '111111111111111111', 'pub', { reason: 'spam' })).code, 'OWN_STORY');
+    for (const id of ['nope', 'priv', 'hid']) {
+      assert.equal((await reportStory(db, READER_ID, id, { reason: 'spam' })).code, 'NO_STORY', id);
+    }
+    assert.equal(db.size(COL.REPORTS), 0);
+  });
+
+  test('setStoryHidden: 숨김/해제, 없는 스토리는 NO_STORY', async () => {
+    const db = createFakeDb({ [COL.STORIES]: stories() });
+    assert.deepEqual(await setStoryHidden(db, 'pub', true, { adminId: ADMIN_ID, reason: '스팸' }, 5000), { ok: true, hidden: true });
+    let doc = await db.collection(COL.STORIES).doc('pub').get();
+    assert.equal(doc.get('hidden'), true);
+    assert.equal(doc.get('hiddenBy'), ADMIN_ID);
+    assert.equal(doc.get('hiddenReason'), '스팸');
+    assert.equal(doc.get('hiddenAt'), 5000);
+
+    await setStoryHidden(db, 'pub', false, { adminId: ADMIN_ID });
+    doc = await db.collection(COL.STORIES).doc('pub').get();
+    assert.equal(doc.get('hidden'), false);
+    assert.equal(doc.get('hiddenReason'), '');
+    assert.equal((await setStoryHidden(db, 'nope', true)).code, 'NO_STORY');
+  });
+
+  test('listReports/resolveReport: 최신순, 상태별 목록, 처리 표시', async () => {
+    const db = createFakeDb({
+      [COL.REPORTS]: {
+        [`${READER_ID}_a`]: { storyId: 'a', status: 'open', createdAt: 1 },
+        [`${READER_ID}_b`]: { storyId: 'b', status: 'open', createdAt: 3 },
+        [`${READER_ID}_c`]: { storyId: 'c', status: 'resolved', createdAt: 2 },
+      },
+    });
+    assert.deepEqual((await listReports(db)).map((r) => r.storyId), ['b', 'a']);
+    assert.deepEqual((await listReports(db, { status: 'resolved' })).map((r) => r.storyId), ['c']);
+    assert.equal((await listReports(db, { limit: 1 })).length, 1);
+
+    assert.deepEqual(await resolveReport(db, `${READER_ID}_b`, 'dismissed', ADMIN_ID, 9000), { ok: true, status: 'dismissed' });
+    const doc = await db.collection(COL.REPORTS).doc(`${READER_ID}_b`).get();
+    assert.equal(doc.get('status'), 'dismissed');
+    assert.equal(doc.get('handledBy'), ADMIN_ID);
+    assert.deepEqual((await listReports(db)).map((r) => r.storyId), ['a']);
+
+    assert.equal((await resolveReport(db, '../hack', 'resolved')).code, 'BAD_ID');
+    assert.equal((await resolveReport(db, `${READER_ID}_a`, 'open')).code, 'BAD_STATUS');
+    assert.equal((await resolveReport(db, `${READER_ID}_zzz`, 'resolved')).code, 'NO_REPORT');
+  });
+
+  test('메모리 세션 저장소: 차단하면 기존 로그인이 끊기고, 해제하면 차단만 풀린다', async () => {
+    const store = createMemorySessionStore();
+    assert.equal(await store.isBlocked(TARGET_ID), false);
+    await store.setBlocked(TARGET_ID, true, { now: 10_000 });
+    assert.equal(await store.isBlocked(TARGET_ID), true);
+    assert.equal(await store.getValidAfter(TARGET_ID), 10_000);
+    await store.setBlocked(TARGET_ID, false);
+    assert.equal(await store.isBlocked(TARGET_ID), false);
+    assert.equal(await store.getValidAfter(TARGET_ID), 10_000); // 풀어도 예전 토큰은 계속 무효
+  });
+
+  describe('HTTP', () => {
+    let server;
+    let base;
+    const savedAdmins = process.env.ADMIN_DISCORD_IDS;
+    const cookieFor = (id, now) => `${WEB.SESSION_COOKIE}=${signJwt({ sub: id, name: '테스터', avatar: null }, undefined, now)}`;
+    const headers = (cookie) => ({ 'Content-Type': 'application/json', [WEB.CSRF_HEADER]: WEB.CSRF_VALUE, ...(cookie ? { Cookie: cookie } : {}) });
+    const send = (method, path, cookie, body) =>
+      fetch(`${base}${path}`, { method, headers: headers(cookie), ...(body === undefined || method === 'GET' ? {} : { body: JSON.stringify(body) }) }); // GET에는 본문을 못 싣는다
+
+    before(async () => {
+      process.env.ADMIN_DISCORD_IDS = ADMIN_ID;
+      const app = express();
+      app.use(express.json());
+      app.use(createWebRouter({ sessionStore: createMemorySessionStore(), rateLimitBackend: createMemoryRateLimitBackend() }));
+      await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
+      base = `http://127.0.0.1:${server.address().port}`;
+    });
+
+    after(async () => {
+      if (savedAdmins === undefined) delete process.env.ADMIN_DISCORD_IDS; else process.env.ADMIN_DISCORD_IDS = savedAdmins;
+      await new Promise((resolve) => server.close(resolve));
+    });
+
+    test('신고: 로그인 필요(401), 보안 헤더 필요(403), 잘못된 사유/긴 설명은 DB 전에 400', async () => {
+      const cookie = cookieFor(READER_ID);
+      assert.equal((await send('POST', '/api/stories/abc/report', undefined, { reason: 'spam' })).status, 401);
+      const noHeader = await fetch(`${base}/api/stories/abc/report`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{"reason":"spam"}' });
+      assert.equal(noHeader.status, 403);
+      assert.equal((await send('POST', '/api/stories/abc/report', cookie, { reason: 'hack' })).status, 400);
+      assert.equal((await send('POST', '/api/stories/abc/report', cookie, {})).status, 400);
+      assert.equal((await send('POST', '/api/stories/abc/report', cookie, { reason: 'spam', detail: 'ㅋ'.repeat(MODERATION.DETAIL_MAX + 1) })).status, 400);
+      assert.equal((await send('POST', '/api/stories/abc/report', cookie, { reason: 'spam', detail: 123 })).status, 400);
+      assert.equal((await send('POST', '/api/stories/bad id!/report', cookie, { reason: 'spam' })).status, 400);
+    });
+
+    test('운영 주소: 비로그인 401, 운영자가 아니면 404, 운영자는 입력 검사까지 통과해야 한다', async () => {
+      const user = cookieFor(READER_ID);
+      const admin = cookieFor(ADMIN_ID);
+      const paths = [
+        ['GET', '/api/admin/reports'],
+        ['PUT', '/api/admin/reports/1234567890_abc'],
+        ['PUT', '/api/admin/stories/abc/hidden'],
+        ['PUT', `/api/admin/users/${TARGET_ID}/blocked`],
+      ];
+      for (const [method, path] of paths) {
+        assert.equal((await send(method, path, undefined, {})).status, 401, `비로그인 ${path}`);
+        assert.equal((await send(method, path, user, {})).status, 404, `일반 사용자 ${path}`);
+      }
+      assert.equal((await send('GET', '/api/admin/reports?status=weird', admin)).status, 400);
+      assert.equal((await send('PUT', '/api/admin/reports/..%2Fhack', admin, { status: 'resolved' })).status, 400);
+      assert.equal((await send('PUT', '/api/admin/stories/abc/hidden', admin, { hidden: 'yes' })).status, 400);
+      assert.equal((await send('PUT', '/api/admin/stories/abc/hidden', admin, { hidden: true, reason: 'ㅋ'.repeat(MODERATION.NOTE_MAX + 1) })).status, 400);
+      assert.equal((await send('PUT', '/api/admin/users/abc/blocked', admin, { blocked: true })).status, 400);
+      assert.equal((await send('PUT', `/api/admin/users/${TARGET_ID}/blocked`, admin, { blocked: 'yes' })).status, 400);
+      assert.equal((await send('PUT', `/api/admin/users/${ADMIN_ID}/blocked`, admin, { blocked: true })).status, 400); // 운영자는 차단 불가
+    });
+
+    test('/api/auth/me: 운영자에게만 isAdmin:true', async () => {
+      const asAdmin = await (await fetch(`${base}/api/auth/me`, { headers: { Cookie: cookieFor(ADMIN_ID) } })).json();
+      const asUser = await (await fetch(`${base}/api/auth/me`, { headers: { Cookie: cookieFor(READER_ID) } })).json();
+      const anon = await (await fetch(`${base}/api/auth/me`)).json();
+      assert.equal(asAdmin.isAdmin, true);
+      assert.equal(asUser.isAdmin, false);
+      assert.equal(anon.isAdmin, false);
+      assert.equal(anon.user, null);
+    });
+
+    test('사용자 차단: 바로 로그인 상태가 끊기고, 해제 뒤 새로 발급한 토큰은 다시 쓸 수 있다', async () => {
+      const admin = cookieFor(ADMIN_ID);
+      const meOf = async (cookie) => (await (await fetch(`${base}/api/auth/me`, { headers: { Cookie: cookie } })).json()).user;
+
+      const before = cookieFor(TARGET_ID);
+      assert.equal((await meOf(before))?.id, TARGET_ID);
+
+      const blocked = await send('PUT', `/api/admin/users/${TARGET_ID}/blocked`, admin, { blocked: true, reason: '테스트' });
+      assert.equal(blocked.status, 200);
+      assert.equal((await meOf(before)), null);                                     // 기존 토큰 끊김
+      assert.equal((await meOf(cookieFor(TARGET_ID, Date.now() + 5000))), null);   // 새 토큰도 차단 중에는 안 됨
+
+      const unblocked = await send('PUT', `/api/admin/users/${TARGET_ID}/blocked`, admin, { blocked: false });
+      assert.equal(unblocked.status, 200);
+      assert.equal((await meOf(before)), null);                                     // 예전 토큰은 계속 무효
+      assert.equal((await meOf(cookieFor(TARGET_ID, Date.now() + 5000)))?.id, TARGET_ID); // 새로 발급한 토큰은 OK
+    });
+  });
+});
+
+// ═════════════════════════════════════════════
+// 7-5: 검색 확장
+// ═════════════════════════════════════════════
+describe('검색 확장 (7-5)', () => {
+  // 어떤 질의가 만들어졌는지 기록만 하는 가짜 DB. rows 를 돌려준다.
+  function recordingDb(rows = [], { fail = null } = {}) {
+    const calls = [];
+    const q = {};
+    for (const method of ['where', 'orderBy', 'limit']) q[method] = (...args) => { calls.push([method, ...args]); return q; };
+    q.get = async () => {
+      calls.push(['get']);
+      if (fail) throw fail;
+      return { docs: rows.map(([id, data]) => ({ id, data: () => data })) };
+    };
+    return { calls, db: { collection: (name) => { calls.push(['collection', name]); return q; } } };
+  }
+  const queryCount = (calls) => calls.filter(([m]) => m === 'get').length;
+
+  test('검색 열쇠: 소문자로 바꾸고, 빈 태그는 버리고, 개수를 제한한다', () => {
+    assert.deepEqual(searchKeys('  지하철 Metro ', ['생존', 'METRO', ' ', 'a', 'b', 'c', 'd']), {
+      titleKey: '지하철 metro',
+      tagKeys: ['생존', 'metro', 'a', 'b', 'c'],
+    });
+    assert.deepEqual(searchKeys(undefined, undefined), { titleKey: '', tagKeys: [] });
+    assert.equal(searchKeys('가'.repeat(80), []).titleKey.length, 50);
+  });
+
+  test('추가 조회 계획: 기본은 없음, 태그/검색어/인기순일 때만', () => {
+    assert.deepEqual(planPublicSearch({}), []);
+    assert.deepEqual(planPublicSearch({ sort: 'latest' }), []);
+    assert.deepEqual(planPublicSearch({ tag: ' 생존 ' }), [{ kind: 'tag', key: '생존' }]);
+    assert.deepEqual(planPublicSearch({ tag: 'Metro', q: '무시됨', sort: 'popular' }), [{ kind: 'tag', key: 'metro' }]); // 태그가 있으면 태그 조회 하나로 충분
+    assert.deepEqual(planPublicSearch({ q: 'Abc' }), [{ kind: 'title', key: 'abc' }]);
+    assert.deepEqual(planPublicSearch({ sort: 'popular' }), [{ kind: 'popular', key: '' }]);
+    assert.deepEqual(planPublicSearch({ q: 'x', sort: 'popular' }), [{ kind: 'title', key: 'x' }, { kind: 'popular', key: '' }]);
+    assert.deepEqual(planPublicSearch({ q: '   ' }), []); // 공백만 있는 검색어는 검색이 아니다
+  });
+
+  test('질의 모양: 항상 공개 스토리만, 종류별 조건과 상한', () => {
+    const popular = recordingDb();
+    buildSliceQuery(popular.db, { kind: 'popular', key: '' });
+    assert.deepEqual(popular.calls, [
+      ['collection', COL.STORIES], ['where', 'isPublic', '==', true],
+      ['orderBy', 'likeCount', 'desc'], ['orderBy', 'playCount', 'desc'], ['limit', BROWSE.SLICE_MAX],
+    ]);
+
+    const tag = recordingDb();
+    buildSliceQuery(tag.db, { kind: 'tag', key: '생존' });
+    assert.deepEqual(tag.calls, [
+      ['collection', COL.STORIES], ['where', 'isPublic', '==', true],
+      ['where', 'tagKeys', 'array-contains', '생존'], ['orderBy', 'createdAt', 'desc'], ['limit', BROWSE.SLICE_MAX],
+    ]);
+
+    const title = recordingDb();
+    buildSliceQuery(title.db, { kind: 'title', key: '지하' });
+    assert.deepEqual(title.calls, [
+      ['collection', COL.STORIES], ['where', 'isPublic', '==', true],
+      ['where', 'titleKey', '>=', '지하'], ['where', 'titleKey', '<=', '지하\uf8ff'], ['orderBy', 'titleKey'], ['limit', BROWSE.TITLE_SLICE_MAX],
+    ]);
+  });
+
+  test('추가 조회 결과는 요약 모양으로 바뀌고 60초 동안 기억된다', async () => {
+    clearPublicCache();
+    const { db, calls } = recordingDb([['s1', { title: '옛 이야기', authorId: 'a', tags: ['생존'], createdAt: 5 }]]);
+    const slice = { kind: 'tag', key: '생존' };
+
+    const first = await loadPublicSlice(slice, { db, now: 1000 });
+    assert.equal(first[0].id, 's1');
+    assert.equal(first[0].title, '옛 이야기');
+    assert.equal(first[0].config, undefined); // 목록용 요약에는 config 가 없다
+
+    await loadPublicSlice(slice, { db, now: 1000 + BROWSE.CACHE_MS - 1 });
+    assert.equal(queryCount(calls), 1, '기억 시간 안에는 다시 읽지 않는다');
+    await loadPublicSlice(slice, { db, now: 1000 + BROWSE.CACHE_MS });
+    assert.equal(queryCount(calls), 2, '시간이 지나면 다시 읽는다');
+  });
+
+  test('추가 조회가 실패해도 오류를 던지지 않고 빈 목록, 실패도 잠깐 기억한다', async () => {
+    clearPublicCache();
+    const logged = mock.method(console, 'error', () => {});
+    try {
+      const { db, calls } = recordingDb([], { fail: new Error('FAILED_PRECONDITION: The query requires an index.') });
+      const slice = { kind: 'popular', key: '' };
+      assert.deepEqual(await loadPublicSlice(slice, { db, now: 5 }), []);
+      assert.deepEqual(await loadPublicSlice(slice, { db, now: 6 }), []);
+      assert.equal(queryCount(calls), 1, '같은 실패 요청이 계속 DB를 두드리지 않는다');
+      assert.equal(logged.mock.callCount(), 1);
+    } finally {
+      logged.mock.restore();
+    }
+  });
+
+  test('기억 목록은 상한을 넘으면 가장 오래된 것부터 버린다', async () => {
+    clearPublicCache();
+    const { db, calls } = recordingDb();
+    for (let i = 0; i < BROWSE.SLICE_CACHE_ENTRIES + 3; i += 1) await loadPublicSlice({ kind: 'title', key: `k${i}` }, { db, now: 1 });
+    const before = queryCount(calls);
+    await loadPublicSlice({ kind: 'title', key: `k${BROWSE.SLICE_CACHE_ENTRIES + 2}` }, { db, now: 2 }); // 가장 최근 것: 기억됨
+    assert.equal(queryCount(calls), before);
+    await loadPublicSlice({ kind: 'title', key: 'k0' }, { db, now: 2 }); // 가장 오래된 것: 이미 버려짐
+    assert.equal(queryCount(calls), before + 1);
+  });
+
+  test('합치기: 중복 제거(먼저 나온 것 우선) + 최신순 정렬', () => {
+    const a = [{ id: 'x', createdAt: 5, title: 'A의 x' }, { id: 'y', createdAt: 9 }];
+    const b = [{ id: 'x', createdAt: 5, title: 'B의 x' }, { id: 'z', createdAt: 1 }];
+    const merged = mergePublicStories(a, b);
+    assert.deepEqual(merged.map((m) => m.id), ['y', 'x', 'z']);
+    assert.equal(merged.find((m) => m.id === 'x').title, 'A의 x');
+    assert.deepEqual(mergePublicStories([], []), []);
+  });
+
+  test('시나리오: 최신 200개 밖의 옛 스토리도 태그/검색으로 찾는다 (합친 뒤 거르기)', () => {
+    const mk = (id, extra) => ({ id, title: id, description: '', tags: [], likeCount: 0, playCount: 0, createdAt: 0, ...extra });
+    const latest = Array.from({ length: 5 }, (_, i) => mk(`new${i}`, { createdAt: 100 - i }));
+    const old = [mk('옛날 생존기', { tags: ['생존'], createdAt: 1, likeCount: 9 })];
+    const all = mergePublicStories(latest, old);
+    assert.equal(filterPublicStories(latest, { tag: '생존' }).total, 0, '합치기 전에는 못 찾는다');
+    assert.equal(filterPublicStories(all, { tag: '생존' }).stories[0].id, '옛날 생존기');
+    assert.equal(filterPublicStories(all, { q: '옛날' }).total, 1);
+    assert.equal(filterPublicStories(all, { sort: 'popular' }).stories[0].id, '옛날 생존기'); // 인기순 1위
+  });
+
+  test('숨긴 스토리는 추가 조회로 들어와도 목록에서 빠진다', () => {
+    const hiddenOne = { id: 'h', title: 'h', tags: ['생존'], hidden: true, createdAt: 3 };
+    const visible = { id: 'v', title: 'v', tags: ['생존'], createdAt: 2 };
+    const result = filterPublicStories(mergePublicStories([], [hiddenOne, visible]), { tag: '생존' });
+    assert.deepEqual(result.stories.map((s) => s.id), ['v']);
+  });
+
+  test('열쇠 채우기(reindex): 빠진/틀린 문서만 고치고, 연습 모드는 아무것도 안 바꾼다', async () => {
+    const db = createFakeDb({
+      [COL.STORIES]: {
+        a: { title: 'Metro 이야기', tags: ['생존', 'METRO'] },                                   // 열쇠 없음 → 채움
+        b: { title: '시장', tags: ['시장'], titleKey: '시장', tagKeys: ['시장'], updatedAt: 7 }, // 이미 맞음 → 그대로
+        c: { title: '고친 제목', tags: [], titleKey: '옛 제목', tagKeys: [] },                   // 틀림 → 고침
+      },
+    });
+    assert.deepEqual(await reindexSearchKeys(db, { dryRun: true }), { total: 3, updated: 2 });
+    assert.equal((await db.collection(COL.STORIES).doc('a').get()).get('titleKey'), undefined);
+
+    assert.deepEqual(await reindexSearchKeys(db), { total: 3, updated: 2 });
+    const a = (await db.collection(COL.STORIES).doc('a').get()).data();
+    assert.deepEqual([a.titleKey, a.tagKeys], ['metro 이야기', ['생존', 'metro']]);
+    assert.equal((await db.collection(COL.STORIES).doc('c').get()).get('titleKey'), '고친 제목');
+    assert.equal((await db.collection(COL.STORIES).doc('b').get()).get('updatedAt'), 7); // updatedAt 은 건드리지 않음
+
+    assert.deepEqual(await reindexSearchKeys(db), { total: 3, updated: 0 }); // 두 번째 실행은 할 일이 없다
+  });
+});
+
+// ═════════════════════════════════════════════
+// 7-6: 요청 크기 + 배포 점검
+// ═════════════════════════════════════════════
+describe('요청 크기와 배포 점검 (7-6)', () => {
+  const goodEnv = () => ({
+    SITE_URL: 'https://example.vercel.app',
+    JWT_SECRET: 'x'.repeat(40),
+    DISCORD_APPLICATION_ID: '123456789012345678',
+    DISCORD_CLIENT_SECRET: 'secret',
+    DISCORD_PUBLIC_KEY: 'a'.repeat(64),
+    FIREBASE_SERVICE_ACCOUNT_BASE64: Buffer.from(JSON.stringify({ project_id: 'p', client_email: 'e@x', private_key: 'k' })).toString('base64'),
+    CRON_SECRET: 'c'.repeat(20),
+    ADMIN_DISCORD_IDS: '123456789012345678',
+  });
+  const goodVercel = { crons: [{ path: '/api/cron/cleanup', schedule: '0 18 * * *' }] };
+  const by = (results, name) => results.filter((r) => r.name === name);
+  const levels = (results) => results.map((r) => r.level);
+
+  test('크기 글자를 바이트로 바꾼다', () => {
+    assert.equal(sizeToBytes('200kb'), 200 * 1024);
+    assert.equal(sizeToBytes('1.5mb'), 1.5 * 1024 * 1024);
+    assert.equal(sizeToBytes('10 B'), 10);
+    assert.ok(Number.isNaN(sizeToBytes('많이')));
+  });
+
+  test('서버 한도는 Vercel 한도(4.5MB)보다 작다', () => {
+    assert.ok(sizeToBytes(REQUEST_LIMITS.DEFAULT) <= sizeToBytes(REQUEST_LIMITS.SCENE_SAVE));
+    assert.ok(sizeToBytes(REQUEST_LIMITS.SCENE_SAVE) < REQUEST_LIMITS.VERCEL_MAX_BYTES);
+    assert.equal(REQUEST_LIMITS.VERCEL_MAX_BYTES, 4_500_000);
+  });
+
+  test('모두 올바르면 오류도 경고도 없다 (운영 기준)', () => {
+    const results = checkDeployment({ env: goodEnv(), vercelJson: goodVercel, isProduction: true });
+    assert.deepEqual(results.filter((r) => r.level !== 'ok'), []);
+  });
+
+  test('점검 결과에 비밀 값이 들어가지 않는다', () => {
+    const env = goodEnv();
+    const dump = JSON.stringify(checkDeployment({ env, vercelJson: goodVercel, isProduction: true }));
+    for (const key of ['JWT_SECRET', 'DISCORD_CLIENT_SECRET', 'FIREBASE_SERVICE_ACCOUNT_BASE64', 'CRON_SECRET']) {
+      assert.ok(!dump.includes(env[key]), `${key} 값이 결과에 나왔습니다`);
+    }
+  });
+
+  test('빈 환경은 필수 항목마다 오류', () => {
+    const results = checkDeployment({ env: {}, vercelJson: goodVercel, isProduction: true });
+    for (const name of ['SITE_URL', 'JWT_SECRET', 'DISCORD_APPLICATION_ID', 'DISCORD_CLIENT_SECRET', 'DISCORD_PUBLIC_KEY', 'FIREBASE_SERVICE_ACCOUNT_BASE64', 'CRON_SECRET']) {
+      assert.equal(by(results, name)[0]?.level, 'error', `${name} 은(는) 오류여야 합니다`);
+    }
+    assert.equal(by(results, 'ADMIN_DISCORD_IDS')[0].level, 'warn'); // 운영자 없음은 경고
+  });
+
+  test('SITE_URL: 끝의 /, http, localhost 는 운영에서 오류', () => {
+    const run = (SITE_URL, isProduction = true) => by(checkDeployment({ env: { ...goodEnv(), SITE_URL }, vercelJson: goodVercel, isProduction }), 'SITE_URL')[0].level;
+    assert.equal(run('https://example.vercel.app/'), 'error');
+    assert.equal(run('http://example.com'), 'error');
+    assert.equal(run('https://localhost:3000'), 'error');
+    assert.equal(run('https://example.vercel.app'), 'ok');
+    assert.equal(run('http://localhost:5173', false), 'ok'); // 개발 기준에서는 localhost 가 정상
+    assert.equal(run('http://localhost:5173/', false), 'error'); // 끝의 / 는 개발에서도 오류
+  });
+
+  test('Redirect 주소 안내는 SITE_URL 이 올바를 때만 나온다', () => {
+    const ok = checkDeployment({ env: goodEnv(), vercelJson: goodVercel, isProduction: true });
+    assert.ok(by(ok, '디스코드 포털 Redirects')[0].message.includes('https://example.vercel.app/api/auth/callback'));
+    const bad = checkDeployment({ env: { ...goodEnv(), SITE_URL: '' }, vercelJson: goodVercel, isProduction: true });
+    assert.equal(by(bad, '디스코드 포털 Redirects').length, 0);
+  });
+
+  test('짧은 비밀/잘못된 키/깨진 서비스 계정은 오류', () => {
+    const run = (patch, name) => by(checkDeployment({ env: { ...goodEnv(), ...patch }, vercelJson: goodVercel, isProduction: true }), name)[0].level;
+    assert.equal(run({ JWT_SECRET: 'x'.repeat(31) }, 'JWT_SECRET'), 'error');
+    assert.equal(run({ CRON_SECRET: 'c'.repeat(CLEANUP.CRON_SECRET_MIN - 1) }, 'CRON_SECRET'), 'error');
+    assert.equal(run({ DISCORD_PUBLIC_KEY: 'z'.repeat(64) }, 'DISCORD_PUBLIC_KEY'), 'error');
+    assert.equal(run({ DISCORD_APPLICATION_ID: 'abc' }, 'DISCORD_APPLICATION_ID'), 'error');
+    assert.equal(run({ FIREBASE_SERVICE_ACCOUNT_BASE64: '!!!' }, 'FIREBASE_SERVICE_ACCOUNT_BASE64'), 'error');
+    assert.equal(run({ FIREBASE_SERVICE_ACCOUNT_BASE64: Buffer.from('{"project_id":"p"}').toString('base64') }, 'FIREBASE_SERVICE_ACCOUNT_BASE64'), 'error');
+  });
+
+  test('개발 기준에서는 CRON_SECRET 없음이 경고(오류 아님)', () => {
+    const { CRON_SECRET, ...env } = goodEnv();
+    const results = checkDeployment({ env, vercelJson: goodVercel, isProduction: false });
+    assert.equal(by(results, 'CRON_SECRET')[0].level, 'warn');
+    assert.ok(!levels(results).includes('error'));
+  });
+
+  test('운영자 ID 형식이 섞이면 경고', () => {
+    const run = (ADMIN_DISCORD_IDS) => by(checkDeployment({ env: { ...goodEnv(), ADMIN_DISCORD_IDS }, vercelJson: goodVercel, isProduction: true }), 'ADMIN_DISCORD_IDS')[0].level;
+    assert.equal(run('123456789012345678, 223456789012345678'), 'ok');
+    assert.equal(run('123456789012345678, 홍길동'), 'warn');
+  });
+
+  test('vercel.json 크론: 없거나 하루 한 번 모양이 아니면 경고', () => {
+    const run = (vercelJson) => by(checkDeployment({ env: goodEnv(), vercelJson, isProduction: true }), vercelJson ? 'vercel.json crons' : 'vercel.json')[0].level;
+    assert.equal(run(goodVercel), 'ok');
+    assert.equal(run({}), 'warn');
+    assert.equal(run({ crons: [{ path: '/api/other', schedule: '0 18 * * *' }] }), 'warn');
+    assert.equal(run({ crons: [{ path: '/api/cron/cleanup', schedule: '*/5 * * * *' }] }), 'warn');
+    assert.equal(run(null), 'warn'); // 파일을 못 읽음
   });
 });

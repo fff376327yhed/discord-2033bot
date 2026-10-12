@@ -22,6 +22,8 @@ export const COL = {
   ENDINGS: 'endingsSeen',     // endingsSeen/{유저ID}_{스토리ID}
   LIKES: 'likes',             // likes/{유저ID}_{스토리ID}  (6단계: 문서 ID가 곧 중복 방지)
   RATE_LIMITS: 'rateLimits',  // rateLimits/{해시}  (7단계: 서버가 여러 개여도 함께 세는 속도제한 카운터)
+  CLEANUP_TASKS: 'cleanupTasks', // cleanupTasks/{스토리ID}  (7-3: 삭제한 스토리의 남은 기록을 지워야 한다는 "할 일 쪽지")
+  REPORTS: 'reports',         // reports/{유저ID}_{스토리ID}  (7-4: 신고. 문서 ID가 곧 "같은 사람이 같은 스토리를 두 번 신고" 방지)
 };
 
 // 필드 설명은 원본 collections.js 주석 참고 (users, stories, scenes, playSessions, endingsSeen)
@@ -1158,14 +1160,20 @@ export const BROWSE = {
   CACHE_MS: 60_000, // 서버 메모리 캐시 유지 시간 (Firestore 읽기 비용 절약)
   QUERY_MAX: 50,    // 검색어 최대 길이
   TAGS_MAX: 30,     // 태그 필터 목록에 보여줄 최대 개수
+  SLICE_MAX: 200,   // (7-5) 태그/인기순 "추가 조회"로 읽어 오는 최대 개수
+  TITLE_SLICE_MAX: 100, // (7-5) 제목 앞부분 검색 "추가 조회"로 읽어 오는 최대 개수
+  SLICE_CACHE_ENTRIES: 100, // (7-5) 추가 조회 결과를 메모리에 기억해 둘 최대 종류 수
+  OFFSET_MAX: 400,  // 웹 목록에서 건너뛸 수 있는 최대 개수 (최신 200 + 추가 조회 200)
 };
 
 // 인스턴스(서버리스 실행 환경) 메모리 안의 캐시
 let publicCache = { at: 0, stories: null };
+const sliceCache = new Map(); // (7-5) '종류:열쇠' → { at, stories }
 
 /** 캐시를 비운다. (좋아요 직후 호출해서 숫자가 바로 반영되게 한다) */
 export function clearPublicCache() {
   publicCache = { at: 0, stories: null };
+  sliceCache.clear();
 }
 
 // 최신 공개 스토리 N개를 읽는다. (기존 인덱스 isPublic + createdAt desc 를 그대로 사용)
@@ -1194,6 +1202,7 @@ export function filterPublicStories(all, { q = '', tag = '', sort = 'latest', of
   const text = (value) => String(value ?? '').toLowerCase();
 
   let list = all.filter((story) => {
+    if (story.hidden === true) return false; // 7-4: 운영자가 숨긴 스토리는 목록/검색에서 제외
     const tags = Array.isArray(story.tags) ? story.tags : [];
     if (tagNeedle && !tags.some((t) => text(t) === tagNeedle)) return false;
     if (!needle) return true;
@@ -1210,6 +1219,7 @@ export function filterPublicStories(all, { q = '', tag = '', sort = 'latest', of
   // 태그 목록은 "검색 전체 범위" 기준으로 센다 (필터를 걸어도 다른 태그를 고를 수 있게)
   const counts = new Map();
   for (const story of all) {
+    if (story.hidden === true) continue; // 숨긴 스토리의 태그는 세지 않는다
     for (const t of Array.isArray(story.tags) ? story.tags : []) {
       const key = text(t);
       const prev = counts.get(key) ?? { tag: t, count: 0 };
@@ -1221,9 +1231,117 @@ export function filterPublicStories(all, { q = '', tag = '', sort = 'latest', of
   return { stories: list.slice(offset, offset + limit), total: list.length, tags };
 }
 
+// ─────────────────────────────────────────────
+// 7-5: 검색 확장 (스토리가 200개를 넘어도 찾을 수 있게)
+// ─────────────────────────────────────────────
+// 기본은 그대로 "최신 공개 200개를 메모리에 두고 거르기"다. (읽기 비용이 가장 싸다)
+// 거기에 아래 3가지일 때만 Firestore에 "추가 조회"를 한 번 더 한다. 결과는 최신 200개와 합쳐서(중복 제거) 거른다.
+//   - 태그를 골랐을 때  : tagKeys(소문자 태그 목록)에서 찾는다.
+//   - 검색어를 썼을 때  : titleKey(소문자 제목)의 "앞부분 일치"로 찾는다. (글자 중간 일치는 최신 200개 안에서만)
+//   - 인기순일 때       : 좋아요/플레이 수 상위를 따로 읽는다.
+// 추가 조회는 Firestore "복합 인덱스"가 필요하다. 인덱스가 없거나 오류가 나면 조용히 건너뛰고(옛날 방식으로 동작) 서버 로그에만 남긴다.
+
+/** 검색용 열쇠 2개를 만든다. 스토리를 만들거나 제목/태그를 고칠 때 문서에 함께 저장한다. */
+export function searchKeys(title, tags) {
+  return {
+    titleKey: String(title ?? '').trim().toLowerCase().slice(0, LIMITS.TITLE),
+    tagKeys: (Array.isArray(tags) ? tags : [])
+      .map((tag) => String(tag).trim().toLowerCase())
+      .filter(Boolean)
+      .slice(0, LIMITS.TAG_COUNT),
+  };
+}
+
+/** 이번 검색에 "추가 조회"가 필요한지 정한다. (순수 함수) 필요 없으면 빈 배열. */
+export function planPublicSearch({ q = '', tag = '', sort = 'latest' } = {}) {
+  const plan = [];
+  const tagKey = String(tag).trim().toLowerCase().slice(0, LIMITS.TAG_LENGTH);
+  const titleKey = String(q).trim().toLowerCase().slice(0, BROWSE.QUERY_MAX);
+  if (tagKey) {
+    plan.push({ kind: 'tag', key: tagKey });
+  } else {
+    if (titleKey) plan.push({ kind: 'title', key: titleKey });
+    if (sort === 'popular') plan.push({ kind: 'popular', key: '' });
+  }
+  return plan;
+}
+
+/** 추가 조회용 Firestore 질의를 만든다. (db를 받으니 테스트에서 가짜를 넣을 수 있다) */
+export function buildSliceQuery(db, { kind, key }) {
+  const base = db.collection(COL.STORIES).where('isPublic', '==', true);
+  if (kind === 'popular') {
+    return base.orderBy('likeCount', 'desc').orderBy('playCount', 'desc').limit(BROWSE.SLICE_MAX);
+  }
+  if (kind === 'tag') {
+    return base.where('tagKeys', 'array-contains', key).orderBy('createdAt', 'desc').limit(BROWSE.SLICE_MAX);
+  }
+  // 제목 앞부분 일치: key 로 시작하는 모든 제목 (\uf8ff 는 "가장 큰 글자"라서 범위의 끝이 된다)
+  return base.where('titleKey', '>=', key).where('titleKey', '<=', `${key}\uf8ff`).orderBy('titleKey').limit(BROWSE.TITLE_SLICE_MAX);
+}
+
+/** 추가 조회 1개를 실행한다. 60초 캐시. 실패하면 빈 목록(= 추가 결과 없음)으로 취급한다. */
+export async function loadPublicSlice(slice, { db = null, now = Date.now() } = {}) {
+  const cacheKey = `${slice.kind}:${slice.key}`;
+  const hit = sliceCache.get(cacheKey);
+  if (hit && now - hit.at < BROWSE.CACHE_MS) return hit.stories;
+
+  let stories = [];
+  try {
+    const snap = await buildSliceQuery(db ?? getDb(), slice).get();
+    stories = snap.docs.map((doc) => summarize(doc.id, doc.data()));
+  } catch (err) {
+    // 대부분 "인덱스가 필요합니다" 오류다. 메시지 안의 링크를 누르면 인덱스를 바로 만들 수 있다.
+    console.error(`[검색 확장 실패 ${cacheKey}] 복합 인덱스가 없을 수 있습니다:`, err?.message ?? err);
+  }
+  // 실패한 결과(빈 목록)도 같은 시간 기억해서, 같은 오류 요청이 계속 Firestore를 두드리지 않게 한다.
+  sliceCache.delete(cacheKey);
+  sliceCache.set(cacheKey, { at: now, stories });
+  while (sliceCache.size > BROWSE.SLICE_CACHE_ENTRIES) sliceCache.delete(sliceCache.keys().next().value); // 가장 오래된 것부터 버림
+  return stories;
+}
+
+/** 여러 목록을 합친다: 같은 id는 먼저 나온 것만 남기고, 최신순(createdAt 큰 순)으로 정렬한다. (순수 함수) */
+export function mergePublicStories(...lists) {
+  const seen = new Set();
+  const merged = [];
+  for (const list of lists) {
+    for (const story of list) {
+      if (seen.has(story.id)) continue;
+      seen.add(story.id);
+      merged.push(story);
+    }
+  }
+  return merged.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+}
+
 /** 공개 스토리 검색 (웹 둘러보기 + 디스코드 /스토리목록 공용) */
 export async function searchPublicStories(options = {}) {
-  return filterPublicStories(await loadPublicStories(), options);
+  const latest = await loadPublicStories();
+  const plan = planPublicSearch(options);
+  if (plan.length === 0) return filterPublicStories(latest, options); // 가장 흔한 경우: 추가 조회 없음
+
+  const extras = await Promise.all(plan.map((slice) => loadPublicSlice(slice)));
+  const result = filterPublicStories(mergePublicStories(latest, ...extras), options);
+  // 태그 목록(칩)은 항상 "최신 200개" 기준으로 보여준다. (태그를 골라도 다른 태그를 고를 수 있게)
+  result.tags = filterPublicStories(latest, { limit: 0 }).tags;
+  return result;
+}
+
+/**
+ * 이미 있는 스토리에 검색 열쇠(titleKey, tagKeys)를 채워 넣는다. (7-5 이전에 만든 스토리용)
+ * dryRun=true 면 바꿀 개수만 센다. 이미 맞는 문서는 건드리지 않아서 여러 번 실행해도 안전하다.
+ */
+export async function reindexSearchKeys(db, { dryRun = false } = {}) {
+  const snap = await db.collection(COL.STORIES).select('title', 'tags', 'titleKey', 'tagKeys').get();
+  let updated = 0;
+  for (const doc of snap.docs) {
+    const want = searchKeys(doc.get('title'), doc.get('tags'));
+    const same = doc.get('titleKey') === want.titleKey && JSON.stringify(doc.get('tagKeys') ?? null) === JSON.stringify(want.tagKeys);
+    if (same) continue;
+    if (!dryRun) await doc.ref.update(want); // updatedAt 은 건드리지 않는다 (에디터의 저장 충돌 검사에 영향 없음)
+    updated += 1;
+  }
+  return { total: snap.size, updated };
 }
 
 /** 좋아요 켜기/끄기. 이미 그 상태면 아무것도 바꾸지 않는다. (여러 번 눌러도 안전) */
@@ -1234,7 +1352,7 @@ export async function setLike(userId, storyId, liked) {
   return db.runTransaction(async (tx) => {
     const [storySnap, likeSnap] = await Promise.all([tx.get(refs.story(storyId)), tx.get(likeRef)]);
     // 없는 스토리와 비공개 스토리는 똑같이 "없음"으로 처리 (존재 여부 숨김)
-    if (!storySnap.exists || !storySnap.get('isPublic')) return { ok: false, code: 'NO_STORY' };
+    if (!storySnap.exists || !storySnap.get('isPublic') || storySnap.get('hidden') === true) return { ok: false, code: 'NO_STORY' }; // 7-4: 숨긴 스토리도 "없음"
 
     let likeCount = storySnap.get('likeCount') ?? 0;
     if (liked && !likeSnap.exists) {
@@ -1319,7 +1437,9 @@ export async function startSession(user, storyId) {
     ]);
 
     if (!storySnap.exists) return { ok: false, code: 'NO_STORY' };
+    if (userSnap.get('blocked') === true) return { ok: false, code: 'BLOCKED' }; // 7-4: 차단된 사용자 (이미 읽은 값이라 추가 비용 없음)
     const story = { ...storySnap.data(), id: storySnap.id };
+    if (isHiddenFrom(story, user.id)) return { ok: false, code: 'HIDDEN' }; // 7-4: 운영자가 숨긴 스토리
     // 비공개 스토리는 제작자 본인만 플레이 가능
     if (!story.isPublic && story.authorId !== user.id) return { ok: false, code: 'FORBIDDEN' };
     if (sessionSnap.exists && sessionSnap.get('status') === 'active') {
@@ -1386,6 +1506,8 @@ export async function chooseInSession(userId, storyId, turn, choiceIndex) {
     if (session.state?.turn !== turn) return { ok: false, code: 'STALE' };
     if (!storySnap.exists) return { ok: false, code: 'NO_STORY', message: '스토리가 삭제되었습니다.' };
     const story = { ...storySnap.data(), id: storySnap.id };
+    // 7-4: 플레이 도중에 운영자가 숨기면 더 진행할 수 없다
+    if (isHiddenFrom(story, userId)) return { ok: false, code: 'HIDDEN', message: '운영자에 의해 숨겨진 스토리라 더 진행할 수 없습니다.' };
 
     const loadScene = makeSceneLoader(tx, storyId);
     const current = await loadScene(session.currentSceneId);
@@ -1425,7 +1547,9 @@ export async function getSessionView(userId, storyId) {
     makeSceneLoader(directReader, storyId)(session.currentSceneId),
   ]);
   if (!storySnap.exists || !scene) return null;
-  return { story: { ...storySnap.data(), id: storySnap.id }, session, scene };
+  const story = { ...storySnap.data(), id: storySnap.id };
+  if (isHiddenFrom(story, userId)) return null; // 7-4: 숨긴 스토리는 이어하기도 막는다
+  return { story, session, scene };
 }
 
 /** 진행 중인 세션 목록 (최신순 최대 5개). 목록 버튼이 한 줄 5개라서 5개로 제한 */
@@ -1468,6 +1592,8 @@ const START_ERRORS = {
   NO_STORY: '스토리를 찾을 수 없습니다.',
   FORBIDDEN: '비공개 스토리입니다.',
   NO_START: '이 스토리는 시작 장면이 없어 플레이할 수 없습니다.',
+  HIDDEN: '운영자에 의해 숨겨진 스토리입니다.',
+  BLOCKED: '이용이 제한된 계정입니다.',
 };
 
 /** 진입점: 상호작용 종류에 따라 나눠서 처리 */
@@ -2107,6 +2233,7 @@ function summarize(id, data) {
     description: data.description ?? '',
     tags: Array.isArray(data.tags) ? data.tags : [],
     isPublic: Boolean(data.isPublic),
+    hidden: data.hidden === true, // 7-4: 운영자가 숨겼는지 (내 스토리 목록에서 알려주는 용도)
     startSceneId: data.startSceneId ?? null,
     sceneCount: data.sceneCount ?? 0,
     playCount: data.playCount ?? 0,
@@ -2171,19 +2298,212 @@ function requireStoryId(req) {
   return id;
 }
 
-// 스토리 삭제 후 정리: 해당 스토리의 플레이 세션/엔딩 도감을 400개씩 지운다.
-// 서버리스 실행 시간 제한을 고려해 최대 5번(2000개)까지만 처리하고, 남으면 false를 돌려준다.
-async function deleteByStoryId(db, collection, storyId) {
-  const PAGE = 400;
-  for (let page = 0; page < 5; page += 1) {
-    const snap = await db.collection(collection).where('storyId', '==', storyId).limit(PAGE).get();
+// ═════════════════════════════════════════════
+// 삭제 후 일괄 정리 (7-3)
+// ═════════════════════════════════════════════
+// 스토리를 지우면 그 스토리의 플레이 세션/엔딩 도감/좋아요 기록이 남는다. (문서가 수천 개일 수도 있다.)
+// 서버리스는 오래 일할 수 없어서 "시간 예산" 안에서만 지우고, 남으면 "할 일 쪽지"(cleanupTasks)를 남겨 둔다.
+// 쪽지는 스토리를 지우는 트랜잭션 안에서 함께 만든다. → 스토리가 지워졌다면 쪽지도 반드시 있다.
+// 하루 한 번 예약 작업(GET /api/cron/cleanup)이나 `node scripts/cli.js cleanup`이 쪽지를 보고 마저 지운다.
+// 예약 작업은 겸사겸사 만료된 속도제한 카운터(rateLimits)도 지운다.
+
+export const CLEANUP = {
+  PAGE: 400,               // 한 번에 지우는 문서 수 (Firestore 배치 한도 500개보다 작게)
+  DELETE_BUDGET_MS: 4000,  // 스토리 삭제 요청 안에서 정리에 쓰는 최대 시간
+  CRON_BUDGET_MS: 7000,    // 예약 정리 1회에 쓰는 최대 시간 (Vercel 함수 시간 제한이 10초일 수 있어 여유를 둔다. 확인 필요)
+  MAX_TASKS: 20,           // 예약 정리 1회에 살펴볼 쪽지 수
+  CRON_SECRET_MIN: 16,     // CRON_SECRET 최소 길이 (Vercel 권장)
+};
+
+// 스토리 삭제 때 함께 정리하는 컬렉션 (모두 storyId 필드가 있다)
+const CLEANUP_COLLECTIONS = [COL.SESSIONS, COL.ENDINGS, COL.LIKES, COL.REPORTS]; // 7-4: 지워진 스토리의 신고도 함께 정리
+
+/** storyId가 같은 문서를 400개씩 지운다. 시간 예산을 넘기면 멈추고 false(아직 남음), 다 지웠으면 true. */
+export async function deleteByStoryId(db, collection, storyId, { budgetMs = CLEANUP.DELETE_BUDGET_MS, now = () => Date.now() } = {}) {
+  const deadline = now() + budgetMs;
+  while (true) {
+    const snap = await db.collection(collection).where('storyId', '==', storyId).limit(CLEANUP.PAGE).get();
     if (snap.empty) return true;
     const batch = db.batch();
     snap.docs.forEach((doc) => batch.delete(doc.ref));
     await batch.commit();
-    if (snap.size < PAGE) return true;
+    if (snap.size < CLEANUP.PAGE) return true; // 한 페이지가 덜 찼다 = 남은 게 없다
+    if (now() >= deadline) return false;       // 시간 끝. 남았을 수 있다
   }
-  return false; // 아직 남았을 수 있음 (7단계 정리 작업에서 처리)
+}
+
+/** 한 스토리의 세션/엔딩 도감/좋아요를 시간 예산 안에서 지운다. 모두 끝나면 true. */
+export async function cleanupStoryRecords(db, storyId, { budgetMs = CLEANUP.DELETE_BUDGET_MS, now = () => Date.now() } = {}) {
+  const deadline = now() + budgetMs;
+  for (const collection of CLEANUP_COLLECTIONS) {
+    const left = deadline - now();
+    if (left <= 0) return false;
+    if (!(await deleteByStoryId(db, collection, storyId, { budgetMs: left, now }))) return false;
+  }
+  return true;
+}
+
+/** 만료된 속도제한 카운터(rateLimits)를 지운다. Firestore TTL 정책을 켰다면 거의 할 일이 없다. */
+export async function deleteExpiredRateLimits(db, { budgetMs = CLEANUP.CRON_BUDGET_MS, now = () => Date.now() } = {}) {
+  const deadline = now() + budgetMs;
+  let deleted = 0;
+  while (true) {
+    const snap = await db.collection(COL.RATE_LIMITS).where('expireAt', '<', new Date(now())).limit(CLEANUP.PAGE).get();
+    if (snap.empty) return { deleted, done: true };
+    const batch = db.batch();
+    snap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+    deleted += snap.size;
+    if (snap.size < CLEANUP.PAGE) return { deleted, done: true };
+    if (now() >= deadline) return { deleted, done: false };
+  }
+}
+
+/**
+ * 예약 정리 1회: 오래된 쪽지부터 처리하고, 남은 시간으로 만료된 속도제한 카운터를 지운다.
+ * 몇 번 실행해도 안전하다. (이미 지운 건 다시 지울 게 없다)
+ */
+export async function runCleanup(db, { budgetMs = CLEANUP.CRON_BUDGET_MS, now = () => Date.now() } = {}) {
+  const deadline = now() + budgetMs;
+  const taskSnap = await db.collection(COL.CLEANUP_TASKS).orderBy('createdAt').limit(CLEANUP.MAX_TASKS).get();
+
+  let tasksDone = 0;
+  for (const doc of taskSnap.docs) {
+    const left = deadline - now();
+    if (left <= 0) break;
+    const stored = doc.get('storyId');
+    const storyId = typeof stored === 'string' && stored ? stored : doc.id;
+    if (await cleanupStoryRecords(db, storyId, { budgetMs: left, now })) {
+      await doc.ref.delete(); // 다 지웠으니 쪽지도 버린다
+      tasksDone += 1;
+    }
+  }
+
+  const left = deadline - now();
+  const rate = left > 0 ? await deleteExpiredRateLimits(db, { budgetMs: left, now }) : { deleted: 0, done: false };
+  return {
+    tasksDone,
+    tasksLeft: taskSnap.size - tasksDone, // 이번에 살펴본 것 중 남은 수 (최대 MAX_TASKS까지만 센다)
+    rateLimitsDeleted: rate.deleted,
+    rateLimitsDone: rate.done,
+  };
+}
+
+/** Vercel 예약 작업이 보내는 "Authorization: Bearer <CRON_SECRET>" 확인. 시간 차이 공격을 막기 위해 해시로 비교한다. */
+export function isCronAuthorized(authHeader, secret) {
+  if (typeof secret !== 'string' || secret.length < CLEANUP.CRON_SECRET_MIN) return false; // 비밀이 약하면 아무도 통과 못 함
+  if (typeof authHeader !== 'string') return false;
+  const digest = (value) => createHash('sha256').update(value).digest();
+  return timingSafeEqual(digest(authHeader), digest(`Bearer ${secret}`));
+}
+
+// ═════════════════════════════════════════════
+// 신고 / 숨김 / 사용자 차단 (7-4)
+// ═════════════════════════════════════════════
+// 흐름: 로그인한 사용자가 공개 스토리를 신고 → reports 문서가 쌓임 → 운영자가 목록을 보고
+//       (1) 스토리 숨김  (2) 작성자 차단  (3) 신고 처리 완료/기각 중 필요한 것을 한다.
+// 운영자 = 환경 변수 ADMIN_DISCORD_IDS 에 적힌 디스코드 ID (쉼표로 구분). 비어 있으면 운영자는 아무도 없다.
+// "숨김"은 isPublic과 별개의 칸(hidden)이다. → 작성자가 비공개/공개를 바꿔도 숨김은 풀리지 않는다.
+// 운영 작업은 웹(/api/admin/...)과 내 PC(node scripts/cli.js reports|hide|unhide|block|unblock) 둘 다 할 수 있다.
+
+export const MODERATION = {
+  REASONS: {
+    spam: '스팸/광고',
+    offensive: '불쾌하거나 부적절한 내용',
+    copyright: '저작권 침해',
+    other: '기타',
+  },
+  DETAIL_MAX: 200, // 신고 자세한 설명 최대 글자 수
+  NOTE_MAX: 100,   // 운영자 메모(숨김/차단 사유) 최대 글자 수
+  LIST_MAX: 50,    // 운영자 신고 목록에 한 번에 보여줄 개수
+  LIST_READ: 200,  // 목록을 만들려고 한 번에 읽는 신고 수 (인덱스 없이 메모리에서 정렬)
+  STATUSES: ['open', 'resolved', 'dismissed'], // 처리 전 / 처리 완료 / 기각
+};
+
+const REPORT_ID_PATTERN = /^\d{5,25}_[A-Za-z0-9_-]{1,64}$/;
+
+/** 환경 변수의 운영자 디스코드 ID 목록. 숫자 ID 형식이 아닌 것은 버린다. */
+export function getAdminIds(env = process.env) {
+  return new Set(
+    String(env.ADMIN_DISCORD_IDS ?? '')
+      .split(',')
+      .map((id) => id.trim())
+      .filter((id) => DISCORD_ID_PATTERN.test(id))
+  );
+}
+
+export function isAdminId(userId, env = process.env) {
+  return getAdminIds(env).has(String(userId));
+}
+
+/** 운영자가 숨긴 스토리인지. 제작자 본인에게는 숨기지 않는다. (자기 스토리가 왜 막혔는지 확인할 수 있게) */
+export function isHiddenFrom(story, userId) {
+  return story?.hidden === true && story.authorId !== userId;
+}
+
+/**
+ * 스토리 신고. 같은 사람이 같은 스토리를 또 신고하면 already:true 로 알리고 숫자를 올리지 않는다.
+ * 실패 code: NO_STORY(없거나 비공개/숨김), OWN_STORY(내 스토리)
+ */
+export async function reportStory(db, userId, storyId, { reason, detail = '' }, now = Date.now()) {
+  const storyRef = db.collection(COL.STORIES).doc(storyId);
+  const snap = await storyRef.get();
+  // 없는 스토리/비공개/이미 숨김은 똑같이 "없음" (존재 여부를 숨긴다)
+  if (!snap.exists || !snap.get('isPublic') || snap.get('hidden') === true) return { ok: false, code: 'NO_STORY' };
+  if (snap.get('authorId') === userId) return { ok: false, code: 'OWN_STORY' };
+
+  try {
+    // create()는 문서가 이미 있으면 실패한다. → 중복 신고를 원자적으로 막는다.
+    await db.collection(COL.REPORTS).doc(userStoryKey(userId, storyId)).create({
+      userId,
+      storyId,
+      authorId: snap.get('authorId'),
+      storyTitle: String(snap.get('title') ?? '').slice(0, LIMITS.TITLE),
+      reason,
+      detail,
+      status: 'open',
+      createdAt: now,
+    });
+  } catch (err) {
+    if (err?.code === 6 || /ALREADY_EXISTS/.test(String(err?.message))) return { ok: true, already: true };
+    throw err;
+  }
+  await storyRef.update({ reportCount: FieldValue.increment(1) }); // 운영자가 "많이 신고된 순"을 볼 때 쓰는 숫자
+  return { ok: true, already: false };
+}
+
+/** 스토리 숨김/숨김 해제 (운영자 전용). 호출한 뒤 clearPublicCache()를 불러 목록 캐시를 비운다. */
+export async function setStoryHidden(db, storyId, hidden, { adminId = '', reason = '' } = {}, now = Date.now()) {
+  const ref = db.collection(COL.STORIES).doc(storyId);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, code: 'NO_STORY' };
+  await ref.update({
+    hidden,
+    hiddenAt: hidden ? now : 0,
+    hiddenBy: hidden ? adminId : '',
+    hiddenReason: hidden ? reason : '',
+  });
+  return { ok: true, hidden };
+}
+
+/** 신고 목록 (운영자 전용). 최신순. 인덱스를 만들지 않으려고 최대 200개를 읽어 메모리에서 정렬한다. */
+export async function listReports(db, { status = 'open', limit = MODERATION.LIST_MAX } = {}) {
+  const snap = await db.collection(COL.REPORTS).where('status', '==', status).limit(MODERATION.LIST_READ).get();
+  return snap.docs
+    .map((doc) => ({ id: doc.id, ...doc.data() }))
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+    .slice(0, limit);
+}
+
+/** 신고 처리 완료(resolved) 또는 기각(dismissed) 표시 */
+export async function resolveReport(db, reportId, status, adminId = '', now = Date.now()) {
+  if (!REPORT_ID_PATTERN.test(String(reportId))) return { ok: false, code: 'BAD_ID' };
+  if (status !== 'resolved' && status !== 'dismissed') return { ok: false, code: 'BAD_STATUS' };
+  const ref = db.collection(COL.REPORTS).doc(reportId);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, code: 'NO_REPORT' };
+  await ref.update({ status, handledAt: now, handledBy: adminId });
+  return { ok: true, status };
 }
 
 // ═════════════════════════════════════════════
@@ -2215,31 +2535,54 @@ export function isTokenRevoked(payload, validAfterMs) {
 /** 메모리 저장소: 테스트와 로컬 실험용 (서버가 꺼지면 사라진다) */
 export function createMemorySessionStore() {
   const map = new Map();
+  const blocked = new Set(); // 7-4: 차단된 사용자
   return {
     async getValidAfter(userId) { return map.get(userId) ?? 0; },
+    async isBlocked(userId) { return blocked.has(userId); },
     async revoke(userId, now = Date.now()) { map.set(userId, now); },
+    async setBlocked(userId, isBlocked, { now = Date.now() } = {}) {
+      if (isBlocked) { blocked.add(userId); map.set(userId, now); } // 차단하면 지금까지 발급된 토큰도 모두 무효
+      else blocked.delete(userId);
+    },
   };
 }
 
-/** Firestore 저장소: 읽기 결과를 15초 동안 인스턴스 메모리에 기억한다. */
+/** Firestore 저장소: 읽기 결과(로그아웃 시각 + 차단 여부)를 15초 동안 인스턴스 메모리에 기억한다. */
 export function createFirestoreSessionStore() {
-  const cache = new Map(); // userId → { validAfter, at }
-  const remember = (userId, validAfter, at) => {
+  const cache = new Map(); // userId → { validAfter, blocked, at }
+  const remember = (userId, validAfter, blocked, at) => {
     if (cache.size >= WEB.SESSION_CACHE_MAX) cache.clear(); // 가득 차면 통째로 비운다 (단순하고 안전)
-    cache.set(userId, { validAfter, at });
+    cache.set(userId, { validAfter, blocked, at });
   };
+  // 사용자 문서를 한 번 읽어 로그아웃 시각과 차단 여부를 함께 얻는다. (읽기 비용은 그대로)
+  async function load(userId, now = Date.now()) {
+    const hit = cache.get(userId);
+    if (hit && now - hit.at < WEB.SESSION_CHECK_CACHE_MS) return hit;
+    const snap = await getDb().collection(COL.USERS).doc(userId).get();
+    const validAfter = Number(snap.get('sessionsValidAfter')) || 0;
+    const blocked = snap.get('blocked') === true;
+    remember(userId, validAfter, blocked, now);
+    return { validAfter, blocked, at: now };
+  }
   return {
-    async getValidAfter(userId, now = Date.now()) {
-      const hit = cache.get(userId);
-      if (hit && now - hit.at < WEB.SESSION_CHECK_CACHE_MS) return hit.validAfter;
-      const snap = await getDb().collection(COL.USERS).doc(userId).get();
-      const validAfter = Number(snap.get('sessionsValidAfter')) || 0;
-      remember(userId, validAfter, now);
-      return validAfter;
-    },
+    async getValidAfter(userId, now = Date.now()) { return (await load(userId, now)).validAfter; },
+    async isBlocked(userId, now = Date.now()) { return (await load(userId, now)).blocked; },
     async revoke(userId, now = Date.now()) {
       await getDb().collection(COL.USERS).doc(userId).set({ sessionsValidAfter: now }, { merge: true });
-      remember(userId, now, now); // 이 인스턴스는 바로 반영 (다른 인스턴스는 최대 15초 뒤)
+      remember(userId, now, cache.get(userId)?.blocked ?? false, now); // 이 인스턴스는 바로 반영 (다른 인스턴스는 최대 15초 뒤)
+    },
+    // 7-4: 차단/해제. 차단하면 sessionsValidAfter도 지금으로 올려 기존 로그인을 모두 끊는다.
+    async setBlocked(userId, isBlocked, { reason = '', now = Date.now() } = {}) {
+      await getDb().collection(COL.USERS).doc(userId).set(
+        {
+          blocked: isBlocked,
+          blockedAt: isBlocked ? now : 0,
+          blockedReason: isBlocked ? reason : '',
+          ...(isBlocked ? { sessionsValidAfter: now } : {}),
+        },
+        { merge: true }
+      );
+      cache.delete(userId); // 다음 확인 때 새로 읽는다
     },
   };
 }
@@ -2316,9 +2659,11 @@ async function discordFetch(url, options) {
 
 // options.sessionStore: 로그아웃 기록을 읽고 쓰는 곳. 기본은 Firestore, 테스트에서는 메모리 저장소를 넣는다.
 // options.rateLimitBackend: 로그인/쓰기 속도제한 카운터를 두는 곳. 기본은 Firestore, 테스트에서는 메모리.
+// options.cleanupRunner: 예약 정리(GET /api/cron/cleanup)가 실제로 하는 일. 기본은 Firestore 정리, 테스트에서는 가짜.
 export function createWebRouter({
   sessionStore = createFirestoreSessionStore(),
   rateLimitBackend = createFirestoreRateLimitBackend(),
+  cleanupRunner = (options) => runCleanup(getDb(), options),
 } = {}) {
   const router = express.Router();
 
@@ -2370,6 +2715,8 @@ export function createWebRouter({
     const id = String(payload.sub);
     try {
       if (isTokenRevoked(payload, await sessionStore.getValidAfter(id))) return null;
+      // 7-4: 차단된 사용자는 로그인 쿠키가 살아 있어도 비로그인으로 취급한다. (같은 캐시를 읽으므로 추가 비용 없음)
+      if (typeof sessionStore.isBlocked === 'function' && (await sessionStore.isBlocked(id))) return null;
     } catch (err) {
       console.error('[auth] 로그아웃 기록 확인 실패', err); // 상세 오류는 서버 로그에만
       return null;
@@ -2465,6 +2812,7 @@ export function createWebRouter({
       // users/{ID} 저장 (처음이면 createdAt 기록). 디스코드 액세스 토큰은 저장하지 않는다.
       const userRef = getDb().collection(COL.USERS).doc(user.id);
       const existing = await userRef.get();
+      if (existing.get('blocked') === true) return res.redirect(302, '/?login=blocked'); // 7-4: 차단된 계정은 로그인 쿠키를 주지 않는다
       const now = Date.now();
       await userRef.set(
         { username: user.username, avatar: user.avatar, updatedAt: now, ...(existing.exists ? {} : { createdAt: now }) },
@@ -2478,8 +2826,9 @@ export function createWebRouter({
   );
 
   // 지금 로그인한 사람 (로그인 안 했으면 user: null)
+  // isAdmin 은 화면에서 운영 메뉴를 보일지 정하는 용도일 뿐이다. 진짜 권한 확인은 서버의 requireAdmin 이 한다. (7-4)
   router.get('/api/auth/me', optionalAuth, (req, res) => {
-    res.json({ user: req.user });
+    res.json({ user: req.user, isAdmin: req.user ? isAdminId(req.user.id) : false });
   });
 
   // 로그아웃: 쿠키를 지우고, 서버에도 "이 시각 이전 토큰은 무효"라고 적어 둔다. (모든 기기에서 로그아웃)
@@ -2560,6 +2909,7 @@ export function createWebRouter({
         title: meta.title,
         description: meta.description,
         tags: meta.tags,
+        ...searchKeys(meta.title, meta.tags), // 7-5: 검색용 열쇠 (titleKey, tagKeys)
         isPublic: false, // 새 스토리는 항상 비공개 (검증 통과 후 공개)
         startSceneId: 'start',
         config,
@@ -2609,7 +2959,7 @@ export function createWebRouter({
       if (!snap.exists) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
       const data = snap.data();
       const isAuthor = req.user?.id === data.authorId;
-      if (!data.isPublic && !isAuthor) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
+      if ((!data.isPublic || data.hidden === true) && !isAuthor) throw new HttpError(404, '스토리를 찾을 수 없습니다.'); // 7-4: 숨김도 "없음"
 
       if (!isAuthor) return res.json({ story: summarize(id, data) }); // 스포일러/설정 노출 방지
 
@@ -2648,7 +2998,12 @@ export function createWebRouter({
           }
         }
         const now = Date.now();
-        tx.update(ref, { ...changes, updatedAt: now });
+        const update = { ...changes, updatedAt: now };
+        if (changes.title !== undefined || changes.tags !== undefined) {
+          // 7-5: 제목이나 태그가 바뀌면 검색 열쇠도 같이 바꾼다 (안 보낸 쪽은 기존 값을 쓴다)
+          Object.assign(update, searchKeys(changes.title ?? story.title, changes.tags ?? story.tags));
+        }
+        tx.update(ref, update);
         return now;
       });
       res.json({ ok: true, updatedAt });
@@ -2743,11 +3098,13 @@ export function createWebRouter({
     })
   );
 
-  // 삭제 방침:
-  //  1) 스토리 문서와 하위 장면(scenes)을 한 트랜잭션으로 삭제 → 새 플레이 시작이 즉시 막힌다.
-  //  2) 그 스토리의 플레이 세션과 엔딩 도감 기록도 함께 삭제한다. (스토리가 없으면 의미가 없고 개인정보 정리 차원)
-  //  3) 서버리스 시간 제한 때문에 한 번에 2000건까지만 정리한다. 남으면 cleanup:'partial'로 알리고,
-  //     남은 세션은 플레이어가 /포기 로 정리할 수 있다. (일괄 정리는 7단계에서 보강)
+  // 삭제 방침 (7-3에서 보강):
+  //  1) 스토리 문서 + 하위 장면(scenes)을 한 트랜잭션으로 삭제한다. → 새 플레이 시작이 즉시 막힌다.
+  //     같은 트랜잭션에서 "정리 쪽지"(cleanupTasks/{스토리ID})도 만든다. → 중간에 서버가 죽어도 정리할 일이 기록에 남는다.
+  //  2) 그 스토리의 플레이 세션/엔딩 도감/좋아요 기록을 시간 예산(4초) 안에서 지운다.
+  //  3) 다 지웠으면 쪽지를 버리고 cleanup:'complete', 남았으면 쪽지를 남기고 cleanup:'partial'.
+  //     남은 것은 하루 한 번 예약 작업(GET /api/cron/cleanup)이나 `node scripts/cli.js cleanup`이 마저 지운다.
+  //  4) 정리 도중 오류가 나도 스토리는 이미 지워졌으므로 500이 아니라 'partial'로 알린다. (쪽지가 남아 있어 나중에 정리된다)
   router.delete(
     '/api/stories/:id',
     requireAuth,
@@ -2755,18 +3112,24 @@ export function createWebRouter({
     wrap(async (req, res) => {
       const id = requireStoryId(req);
       const db = getDb();
+      const taskRef = db.collection(COL.CLEANUP_TASKS).doc(id);
 
       await db.runTransaction(async (tx) => {
         const { ref, sceneRefs } = await readOwned(tx, id, req.user.id, { withScenes: 'always' });
         sceneRefs.forEach((sceneRef) => tx.delete(sceneRef));
         tx.delete(ref);
+        tx.set(taskRef, { storyId: id, authorId: req.user.id, createdAt: Date.now() }); // 정리 쪽지
       });
 
-      const sessionsDone = await deleteByStoryId(db, COL.SESSIONS, id);
-      const endingsDone = await deleteByStoryId(db, COL.ENDINGS, id);
-      const likesDone = await deleteByStoryId(db, COL.LIKES, id); // 6단계: 좋아요 기록도 함께 정리
+      let complete = false;
+      try {
+        complete = await cleanupStoryRecords(db, id);
+        if (complete) await taskRef.delete();
+      } catch (err) {
+        console.error('[스토리 삭제 후 정리 실패 - 쪽지가 남아 있어 나중에 정리됩니다]', err);
+      }
       clearPublicCache();
-      res.json({ ok: true, cleanup: sessionsDone && endingsDone && likesDone ? 'complete' : 'partial' });
+      res.json({ ok: true, cleanup: complete ? 'complete' : 'partial' });
     })
   );
 
@@ -2789,7 +3152,7 @@ export function createWebRouter({
     browseLimiter,
     optionalAuth,
     wrap(async (req, res) => {
-      const offset = toInt(req.query.offset, 0, BROWSE.FETCH_MAX, 0);
+      const offset = toInt(req.query.offset, 0, BROWSE.OFFSET_MAX, 0);
       const result = await searchPublicStories({
         q: queryText(req.query.q, BROWSE.QUERY_MAX),
         tag: queryText(req.query.tag, LIMITS.TAG_LENGTH),
@@ -2856,5 +3219,223 @@ export function createWebRouter({
     })
   );
 
+  // ───────────── 7-3: 예약 정리 (Vercel Cron이 하루 한 번 GET으로 부른다) ─────────────
+  // 로그인 사용자가 아니라 Vercel이 부르므로 "Authorization: Bearer <CRON_SECRET>"으로 확인한다.
+  // CRON_SECRET이 없거나 짧으면 아무도 못 부르게 닫는다. (503)
+  router.get(
+    '/api/cron/cleanup',
+    wrap(async (req, res) => {
+      const secret = process.env.CRON_SECRET;
+      if (!secret || secret.length < CLEANUP.CRON_SECRET_MIN) {
+        throw new HttpError(503, `CRON_SECRET 환경 변수(${CLEANUP.CRON_SECRET_MIN}자 이상)를 먼저 설정해 주세요.`);
+      }
+      if (!isCronAuthorized(req.headers.authorization, secret)) throw new HttpError(401, '권한이 없습니다.');
+      res.json({ ok: true, ...(await cleanupRunner({ budgetMs: CLEANUP.CRON_BUDGET_MS })) });
+    })
+  );
+
+  // ───────────── 7-4: 신고 / 운영 ─────────────
+
+  // 신고: body { reason: 'spam'|'offensive'|'copyright'|'other', detail?: 글자(200자 이하) }
+  // 같은 사람이 같은 스토리를 또 신고해도 오류 없이 already:true 로 답한다.
+  router.post(
+    '/api/stories/:id/report',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const body = isPlainObject(req.body) ? req.body : {};
+      const errors = [];
+      const reason = typeof body.reason === 'string' && Object.hasOwn(MODERATION.REASONS, body.reason) ? body.reason : null;
+      if (!reason) errors.push(`reason: ${Object.keys(MODERATION.REASONS).join(', ')} 중 하나여야 합니다.`);
+      const detail = cleanText(body.detail, MODERATION.DETAIL_MAX, 'detail', errors, { multiline: true });
+      failIfInvalid(errors);
+
+      const result = await reportStory(getDb(), req.user.id, id, { reason, detail });
+      if (!result.ok) {
+        if (result.code === 'OWN_STORY') throw new HttpError(400, '내 스토리는 신고할 수 없습니다.');
+        throw new HttpError(404, '스토리를 찾을 수 없습니다.');
+      }
+      res.json({ ok: true, already: result.already });
+    })
+  );
+
+  // 운영자만 통과. 운영자가 아니면 이런 주소가 있다는 사실도 알려주지 않는다. (404)
+  const requireAdmin = (req, res, next) =>
+    requireAuth(req, res, () => {
+      if (!isAdminId(req.user.id)) return res.status(404).json({ error: '찾을 수 없는 주소입니다.' });
+      next();
+    });
+
+  // 신고 목록: ?status=open|resolved|dismissed (기본 open)
+  router.get(
+    '/api/admin/reports',
+    requireAdmin,
+    wrap(async (req, res) => {
+      const status = typeof req.query.status === 'string' ? req.query.status : 'open';
+      if (!MODERATION.STATUSES.includes(status)) throw new HttpError(400, 'status 값이 올바르지 않습니다.');
+      res.json({ reports: await listReports(getDb(), { status }) });
+    })
+  );
+
+  // 신고 처리: body { status: 'resolved' | 'dismissed' }
+  router.put(
+    '/api/admin/reports/:reportId',
+    requireAdmin,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const status = isPlainObject(req.body) ? req.body.status : undefined;
+      // 입력부터 검사한다. (잘못된 요청이 DB까지 가지 않게)
+      if (!REPORT_ID_PATTERN.test(String(req.params.reportId)) || (status !== 'resolved' && status !== 'dismissed')) {
+        throw new HttpError(400, '신고 ID 또는 status 값이 올바르지 않습니다.');
+      }
+      const result = await resolveReport(getDb(), req.params.reportId, status, req.user.id);
+      if (!result.ok) throw new HttpError(404, '신고를 찾을 수 없습니다.');
+      res.json({ ok: true, status: result.status });
+    })
+  );
+
+  // 스토리 숨김/해제: body { hidden: true | false, reason?: 운영자 메모(100자 이하) }
+  router.put(
+    '/api/admin/stories/:id/hidden',
+    requireAdmin,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const body = isPlainObject(req.body) ? req.body : {};
+      if (typeof body.hidden !== 'boolean') throw new HttpError(400, 'hidden은 true/false여야 합니다.');
+      const errors = [];
+      const reason = cleanText(body.reason, MODERATION.NOTE_MAX, 'reason', errors);
+      failIfInvalid(errors);
+
+      const result = await setStoryHidden(getDb(), id, body.hidden, { adminId: req.user.id, reason });
+      if (!result.ok) throw new HttpError(404, '스토리를 찾을 수 없습니다.');
+      clearPublicCache(); // 이 인스턴스의 목록 캐시를 비운다 (다른 인스턴스는 최대 60초 뒤 반영)
+      res.json({ ok: true, hidden: result.hidden });
+    })
+  );
+
+  // 사용자 차단/해제: body { blocked: true | false, reason?: 운영자 메모 }
+  // 차단하면 기존 로그인이 모두 끊기고(sessionsValidAfter 재사용), 다시 로그인할 수 없으며, 봇 플레이도 막힌다.
+  router.put(
+    '/api/admin/users/:userId/blocked',
+    requireAdmin,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const userId = String(req.params.userId);
+      if (!DISCORD_ID_PATTERN.test(userId)) throw new HttpError(400, '올바르지 않은 사용자 ID입니다.');
+      const body = isPlainObject(req.body) ? req.body : {};
+      if (typeof body.blocked !== 'boolean') throw new HttpError(400, 'blocked는 true/false여야 합니다.');
+      if (body.blocked && isAdminId(userId)) throw new HttpError(400, '운영자는 차단할 수 없습니다.'); // 실수로 자기 자신을 잠그는 것 방지
+      const errors = [];
+      const reason = cleanText(body.reason, MODERATION.NOTE_MAX, 'reason', errors);
+      failIfInvalid(errors);
+
+      await sessionStore.setBlocked(userId, body.blocked, { reason });
+      res.json({ ok: true, blocked: body.blocked });
+    })
+  );
+
   return router;
+}
+
+// ═════════════════════════════════════════════
+// 7-6: 요청 크기 한도 + 배포 점검
+// ═════════════════════════════════════════════
+
+// 서버가 받아 주는 본문 크기. api/index.js 가 이 값을 쓴다.
+// Vercel 함수는 플랫폼 차원에서 본문 4.5MB를 넘으면 우리 코드에 닿기도 전에 413으로 막는다. (공식 문서 확인함)
+// 그래서 우리 한도는 그보다 훨씬 작게 둔다. (한글은 글자당 3바이트)
+export const REQUEST_LIMITS = {
+  DEFAULT: '200kb',                   // 대부분의 요청
+  SCENE_SAVE: '1.5mb',                // 장면 전체 저장(PUT /api/stories/:id/scenes)만
+  VERCEL_MAX_BYTES: 4_500_000,        // Vercel 의 본문 한도 (4.5MB를 안전하게 10진수로 계산)
+};
+
+/** '1.5mb' 같은 글자를 바이트 숫자로 바꾼다. 알 수 없는 모양이면 NaN. */
+export function sizeToBytes(text) {
+  const match = /^(\d+(?:\.\d+)?)\s*(b|kb|mb)$/i.exec(String(text).trim());
+  if (!match) return Number.NaN;
+  const unit = { b: 1, kb: 1024, mb: 1024 * 1024 }[match[2].toLowerCase()];
+  return Math.floor(Number(match[1]) * unit);
+}
+
+/**
+ * 배포 전 점검. 비밀 값은 절대 결과에 담지 않는다. (순수 함수: env 와 vercel.json 내용을 받아서 판단만 한다)
+ * @returns {{ level: 'ok'|'warn'|'error', name: string, message: string }[]}
+ */
+export function checkDeployment({ env = {}, vercelJson = null, isProduction = false } = {}) {
+  const out = [];
+  const add = (level, name, message) => out.push({ level, name, message });
+  const text = (key) => String(env[key] ?? '').trim();
+
+  // 1) SITE_URL
+  const site = text('SITE_URL');
+  if (!site) {
+    add('error', 'SITE_URL', '비어 있습니다. 로그인 후 돌아올 주소입니다. 운영에서는 배포 도메인(https://..., 끝에 / 없이)을 넣으세요.');
+  } else if (/\/$/.test(site)) {
+    add('error', 'SITE_URL', '끝에 / 가 있습니다. 지우세요. (디스코드 Redirect 주소와 한 글자라도 다르면 로그인이 실패합니다)');
+  } else if (isProduction && !/^https:\/\//.test(site)) {
+    add('error', 'SITE_URL', '운영에서는 https:// 로 시작해야 합니다.');
+  } else if (isProduction && /localhost|127\.0\.0\.1/.test(site)) {
+    add('error', 'SITE_URL', '운영 값이 localhost 입니다. 배포 도메인으로 바꾸세요.');
+  } else {
+    add('ok', 'SITE_URL', `${site}`);
+    add('ok', '디스코드 포털 Redirects', `OAuth2 → Redirects 에 정확히 "${site}/api/auth/callback" 이(가) 등록돼 있어야 합니다. (직접 확인 필요)`);
+  }
+
+  // 2) 로그인/서명 관련
+  if (text('JWT_SECRET').length >= 32) add('ok', 'JWT_SECRET', '32자 이상');
+  else add('error', 'JWT_SECRET', '없거나 32자보다 짧습니다. 긴 무작위 글자로 만드세요. (로그인 쿠키 서명용)');
+
+  if (/^\d{17,20}$/.test(text('DISCORD_APPLICATION_ID'))) add('ok', 'DISCORD_APPLICATION_ID', '숫자 ID 형식');
+  else add('error', 'DISCORD_APPLICATION_ID', '없거나 숫자 17~20자리가 아닙니다.');
+
+  if (text('DISCORD_CLIENT_SECRET')) add('ok', 'DISCORD_CLIENT_SECRET', '입력됨');
+  else add('error', 'DISCORD_CLIENT_SECRET', '비어 있습니다. (디스코드 로그인에 필요)');
+
+  if (/^[0-9a-fA-F]{64}$/.test(text('DISCORD_PUBLIC_KEY'))) add('ok', 'DISCORD_PUBLIC_KEY', '16진수 64자');
+  else add('error', 'DISCORD_PUBLIC_KEY', '없거나 16진수 64자가 아닙니다. (슬래시 커맨드 서명 검증용)');
+
+  // 3) Firestore 서비스 계정 (값은 출력하지 않고 "읽을 수 있는지"만 본다)
+  try {
+    const json = JSON.parse(Buffer.from(text('FIREBASE_SERVICE_ACCOUNT_BASE64'), 'base64').toString('utf8'));
+    const missing = ['project_id', 'client_email', 'private_key'].filter((key) => !json?.[key]);
+    if (missing.length === 0) add('ok', 'FIREBASE_SERVICE_ACCOUNT_BASE64', '해석 성공');
+    else add('error', 'FIREBASE_SERVICE_ACCOUNT_BASE64', `JSON 안에 ${missing.join(', ')} 이(가) 없습니다.`);
+  } catch {
+    add('error', 'FIREBASE_SERVICE_ACCOUNT_BASE64', '없거나 base64 → JSON 으로 해석되지 않습니다.');
+  }
+
+  // 4) 예약 정리
+  if (text('CRON_SECRET').length >= CLEANUP.CRON_SECRET_MIN) add('ok', 'CRON_SECRET', `${CLEANUP.CRON_SECRET_MIN}자 이상`);
+  else add(isProduction ? 'error' : 'warn', 'CRON_SECRET', `없거나 ${CLEANUP.CRON_SECRET_MIN}자 미만입니다. 이러면 /api/cron/cleanup 은 503으로 막힙니다.`);
+
+  // 5) 운영자
+  const rawAdmins = text('ADMIN_DISCORD_IDS').split(',').map((id) => id.trim()).filter(Boolean);
+  const goodAdmins = getAdminIds(env);
+  if (rawAdmins.length === 0) add('warn', 'ADMIN_DISCORD_IDS', '비어 있습니다. 운영자가 없어 신고 처리를 웹에서 할 수 없습니다. (cli 명령은 가능)');
+  else if (goodAdmins.size !== rawAdmins.length) add('warn', 'ADMIN_DISCORD_IDS', '숫자 ID 형식이 아닌 항목이 있어 무시됩니다.');
+  else add('ok', 'ADMIN_DISCORD_IDS', `운영자 ${goodAdmins.size}명`);
+
+  // 6) vercel.json 의 크론
+  if (!vercelJson) {
+    add('warn', 'vercel.json', '내용을 읽지 못했습니다. crons 설정을 직접 확인하세요.');
+  } else {
+    const cron = (Array.isArray(vercelJson.crons) ? vercelJson.crons : []).find((c) => c?.path === '/api/cron/cleanup');
+    if (!cron) {
+      add('warn', 'vercel.json crons', '"/api/cron/cleanup" 크론이 없습니다. 자동 정리가 돌지 않습니다. (직접 `node scripts/cli.js cleanup` 으로는 가능)');
+    } else if (!/^\d+ \d+ \* \* \*$/.test(String(cron.schedule ?? '').trim())) {
+      add('warn', 'vercel.json crons', `"${cron.schedule}" 는 하루 한 번 모양("분 시 * * *")이 아닙니다. Hobby 요금제는 하루 1번까지로 알고 있습니다. (공식 문서 확인 필요)`);
+    } else {
+      add('ok', 'vercel.json crons', `정리 크론: ${cron.schedule} (UTC 기준)`);
+    }
+  }
+
+  // 7) 요청 크기
+  const sceneBytes = sizeToBytes(REQUEST_LIMITS.SCENE_SAVE);
+  if (sceneBytes < REQUEST_LIMITS.VERCEL_MAX_BYTES) add('ok', '요청 크기', `장면 저장 한도 ${REQUEST_LIMITS.SCENE_SAVE} < Vercel 한도 4.5MB`);
+  else add('error', '요청 크기', '장면 저장 한도가 Vercel 한도(4.5MB) 이상입니다. 더 작게 줄이세요.');
+
+  return out;
 }
