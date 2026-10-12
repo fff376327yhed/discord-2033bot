@@ -1,7 +1,7 @@
 // 앱 화면: 로그인 → 내 스토리 목록 → 편집기 (+ 운영자라면 관리자 탭)
 // 예전의 Login.jsx, StoryList.jsx 를 이 파일 안으로 합쳤다.
 import { useEffect, useState } from 'react';
-import { api, avatarUrl } from '../api.js';
+import { api, avatarUrl } from './lib.js';
 import Editor from './Editor.jsx';
 
 /* ───────────────────────── Login ───────────────────────── */
