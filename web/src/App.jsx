@@ -440,7 +440,20 @@ export default function App() {
           </>
         )}
         <div className="spacer" />
-        <span className="user">{user.username ?? user.name ?? '사용자'}</span>
+        <span
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
+          title={`디스코드 계정: ${user.username ?? user.name ?? '이름 모름'} (${user.id ?? '-'})`}
+        >
+          <img
+            src={avatarUrl({ id: user.id, avatar: user.avatar }, 64)}
+            alt="내 디스코드 프로필"
+            width={28}
+            height={28}
+            referrerPolicy="no-referrer"
+            style={{ borderRadius: '50%', display: 'block' }}
+          />
+          <span className="user">{user.username ?? user.name ?? '사용자'}</span>
+        </span>
         <button className="btn btn-small" onClick={handleLogout}>로그아웃</button>
       </div>
 

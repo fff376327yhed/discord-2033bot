@@ -654,6 +654,7 @@ function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, confi
 /* ═════════════════════════ 6) Editor (본체) ═════════════════════════ */
 
 const DESKTOP_QUERY = '(min-width: 901px)';
+const AUTOSAVE_DELAY_MS = 2000; // 마지막 입력 후 이 시간이 지나면 자동 저장
 
 let sceneCounter = 0;
 function newSceneKey(scenes) {
@@ -713,18 +714,31 @@ export default function Editor({ storyId, onBack }) {
   const [sideOpen, setSideOpen] = useState(() => window.matchMedia(DESKTOP_QUERY).matches);
   const contentRef = useRef(null);
 
+  // ── 자동 저장용 ──
+  const savedRef = useRef(null);      // 마지막으로 서버와 맞춘 시점의 스냅샷 (참조 비교용)
+  const latestRef = useRef(null);     // 항상 최신 편집 내용
+  const baseRef = useRef(0);          // 항상 최신 baseUpdatedAt
+  const savingRef = useRef(false);    // 저장 중복 방지
+  const conflictRef = useRef(false);  // 409(충돌) 후에는 자동 저장 중지
+  const [saveTick, setSaveTick] = useState(0); // 저장이 끝난 뒤 변경분이 있는지 다시 확인시키는 용도
+  latestRef.current = { meta, config, scenes, startSceneId };
+
   const load = useCallback(() => {
     setLoading(true);
     api.getStory(storyId)
       .then((data) => {
         const { story, scenes: loadedScenes } = data;
-        setMeta({ title: story.title, description: story.description, tags: story.tags });
+        const loadedMeta = { title: story.title, description: story.description, tags: story.tags };
+        setMeta(loadedMeta);
         setConfig(story.config);
         setScenes(loadedScenes);
         setStartSceneId(story.startSceneId);
         setIsPublic(story.isPublic);
         setBaseUpdatedAt(story.updatedAt);
         setSelected(story.startSceneId in loadedScenes ? story.startSceneId : Object.keys(loadedScenes)[0] ?? null);
+        savedRef.current = { meta: loadedMeta, config: story.config, scenes: loadedScenes, startSceneId: story.startSceneId };
+        baseRef.current = story.updatedAt;
+        conflictRef.current = false;
       })
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
@@ -799,28 +813,77 @@ export default function Editor({ storyId, onBack }) {
     setSelected((cur) => (cur === key ? startSceneId : cur));
   }
 
-  async function handleSave() {
-    setSaving(true);
-    setSaveMsg(null);
+  function isDirty() {
+    const s = savedRef.current, n = latestRef.current;
+    return Boolean(s) && (s.meta !== n.meta || s.config !== n.config || s.scenes !== n.scenes || s.startSceneId !== n.startSceneId);
+  }
+
+  // auto=true 이면 조용히 저장(변경이 없으면 건너뜀), false 이면 기존 [저장] 버튼 동작
+  async function save({ auto = false } = {}) {
+    if (savingRef.current) return false;
+    if (auto && !isDirty()) return true;
+    const snap = latestRef.current; // 저장하는 동안 편집이 이어져도 "보낸 내용"을 기준으로 삼는다
+    savingRef.current = true;
+    if (!auto) { setSaving(true); setSaveMsg(null); }
     try {
-      await api.updateStory(storyId, { title: meta.title, description: meta.description, tags: meta.tags, baseUpdatedAt });
+      await api.updateStory(storyId, { title: snap.meta.title, description: snap.meta.description, tags: snap.meta.tags, baseUpdatedAt: baseRef.current });
       const scenesToSend = {};
-      for (const [key, scene] of Object.entries(scenes)) {
+      for (const [key, scene] of Object.entries(snap.scenes)) {
         const { id, ...rest } = scene;
         scenesToSend[key] = rest;
       }
-      const result = await api.saveScenes(storyId, { scenes: scenesToSend, config, startSceneId, baseUpdatedAt });
+      const result = await api.saveScenes(storyId, { scenes: scenesToSend, config: snap.config, startSceneId: snap.startSceneId, baseUpdatedAt: baseRef.current });
+      baseRef.current = result.updatedAt;
       setBaseUpdatedAt(result.updatedAt);
+      savedRef.current = snap;
       setValidation(result.validation);
-      setSaveMsg('저장했습니다.');
+      setSaveMsg(auto ? `자동 저장됨 · ${new Date().toLocaleTimeString('ko-KR')}` : '저장했습니다.');
+      setSaveTick((t) => t + 1); // 저장 중에 또 고친 내용이 있으면 다시 예약
+      return true;
     } catch (err) {
-      if (err.status === 409) setSaveMsg('다른 곳에서 먼저 수정되었습니다. 새로고침 후 다시 시도하세요.');
-      else if (err.status === 422) { setValidation(err.validation); setSaveMsg('공개 중인 스토리는 오류가 없어야 저장됩니다. 비공개로 바꾼 뒤 다시 시도하세요.'); }
-      else setSaveMsg(`저장 실패: ${err.message}`);
+      if (err.status === 409) {
+        conflictRef.current = true;
+        setSaveMsg(auto ? '다른 곳에서 먼저 수정되어 자동 저장을 멈췄어요. 새로고침 후 다시 시도하세요.' : '다른 곳에서 먼저 수정되었습니다. 새로고침 후 다시 시도하세요.');
+      } else if (err.status === 422) {
+        setValidation(err.validation);
+        setSaveMsg('공개 중인 스토리는 오류가 없어야 저장됩니다. 비공개로 바꾼 뒤 다시 시도하세요.');
+      } else {
+        setSaveMsg(`${auto ? '자동 ' : ''}저장 실패: ${err.message}`);
+      }
+      return false; // 실패 시 saveTick 을 올리지 않음 → 다음 편집 때까지 재시도 안 함(무한 재시도 방지)
     } finally {
-      setSaving(false);
+      savingRef.current = false;
+      if (!auto) setSaving(false);
     }
   }
+
+  function handleSave() { return save({ auto: false }); }
+
+  // 뒤로 가기: 저장 안 된 변경이 있으면 먼저 저장하고, 실패하면 확인을 받는다
+  async function handleBack() {
+    while (savingRef.current) await new Promise((r) => setTimeout(r, 100));
+    if (isDirty()) {
+      const ok = !isPublic && (await save({ auto: true }));
+      if (!ok && !confirm('저장하지 않은 변경 사항이 있어요. 저장하지 않고 나갈까요?')) return;
+    }
+    onBack();
+  }
+
+  // 자동 저장: 편집 내용이 바뀌면 타이머를 다시 걸고, 조용해지면 저장 (공개 스토리는 제외)
+  useEffect(() => {
+    if (loading || isPublic || conflictRef.current || !isDirty()) return undefined;
+    const timer = setTimeout(() => save({ auto: true }), AUTOSAVE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [loading, isPublic, meta, config, scenes, startSceneId, saveTick]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 탭 닫기/새로고침 시 저장 안 된 내용이 있으면 브라우저 경고
+  useEffect(() => {
+    function warn(e) {
+      if (isDirty()) { e.preventDefault(); e.returnValue = ''; }
+    }
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleVisibility(next) {
     try {
@@ -855,7 +918,7 @@ export default function Editor({ storyId, onBack }) {
       {/* ───────── 왼쪽: 페이지 목록 ───────── */}
       <aside className="ed-side">
         <div className="ed-side-head">
-          <button type="button" className="ed-back" onClick={onBack} title="내 스토리로 돌아가기">
+          <button type="button" className="ed-back" onClick={handleBack} title="내 스토리로 돌아가기">
             <span aria-hidden="true">‹</span> {meta.title || '(제목 없음)'}
           </button>
           <button type="button" className="icon-btn" onClick={() => setPanel('settings')} title="스토리 설정" aria-label="스토리 설정">⚙</button>
@@ -900,6 +963,7 @@ export default function Editor({ storyId, onBack }) {
             {sideOpen ? '«' : '☰'}
           </button>
           <div className="spacer" />
+          {isPublic && !saveMsg && <span className="ed-msg muted">공개 중이라 자동 저장이 꺼져 있어요</span>}
           {saveMsg && <span className="ed-msg" role="status">{saveMsg}</span>}
           <button type="button" className="btn" onClick={() => setPreview(true)}>▶ 미리보기</button>
           <button type="button" className="btn btn-primary" disabled={saving} onClick={handleSave}>{saving ? '저장 중...' : '저장'}</button>
