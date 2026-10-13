@@ -1,0 +1,213 @@
+{
+  "title": "해정역, 2033",
+  "description": "가스에 잠긴 2033년의 지하철망. 체력과 정신력을 지키며, 수비대와 암시장 사이에서 살아남는 법을 찾아라.",
+  "tags": ["포스트아포칼립스", "생존", "호감도", "멀티엔딩"],
+  "startSceneId": "start",
+  "config": {
+    "stats": {
+      "hp":     { "label": "체력",   "initial": 100, "min": 0, "max": 100, "onZero": "ending_dead" },
+      "sanity": { "label": "정신력", "initial": 70,  "min": 0, "max": 100, "onZero": "ending_mad" }
+    },
+    "resources": {
+      "food":   { "label": "식량",      "initial": 3, "min": 0, "max": 99 },
+      "filter": { "label": "정화 필터", "initial": 1, "min": 0, "max": 99 }
+    },
+    "factions": {
+      "defense": { "label": "수비대 호감도", "initial": 0, "min": -100, "max": 100 },
+      "market":  { "label": "암시장 호감도", "initial": 0, "min": -100, "max": 100 }
+    },
+    "items": {
+      "gasmask": { "label": "방독면" },
+      "keycard": { "label": "관리실 카드키" }
+    },
+    "flags": {
+      "met_merchant": { "label": "상인과 만났다" },
+      "found_secret":  { "label": "비밀 통로를 발견했다" }
+    },
+    "startInventory": {}
+  },
+  "scenes": {
+    "start": {
+      "body": "사이렌이 그친 지 세 시간. 해정역 승강장, 비상등만 깜빡인다. 공기 중엔 옅은 유황 냄새. 어디로 먼저 움직일지 정해야 한다.",
+      "station": "해정역",
+      "isEnding": false,
+      "onEnter": [],
+      "choices": [
+        { "label": "크레이트가 쌓인 짐칸을 뒤진다", "to": "scene_search", "condition": [], "effects": [], "hideWhenLocked": false },
+        { "label": "수비대 초소로 향한다", "to": "scene_guardpost", "condition": [], "effects": [], "hideWhenLocked": false },
+        { "label": "암시장 쪽으로 간다", "to": "scene_market", "condition": [], "effects": [], "hideWhenLocked": false }
+      ],
+      "posX": 0, "posY": 0
+    },
+
+    "scene_search": {
+      "body": "먼지 쌓인 크레이트 하나가 눈에 띈다. 잠금장치는 반쯤 부서져 있다. 열어볼까, 아니면 괜히 시간 끌지 말고 넘어갈까.",
+      "isEnding": false,
+      "onEnter": [],
+      "choices": [
+        { "label": "크레이트를 연다", "to": "scene_hub", "condition": [],
+          "effects": [ { "type": "item", "key": "gasmask", "delta": 1 }, { "type": "stat", "key": "sanity", "delta": -5 } ],
+          "hideWhenLocked": false },
+        { "label": "그냥 지나친다", "to": "scene_hub", "condition": [], "effects": [], "hideWhenLocked": false }
+      ],
+      "posX": 260, "posY": 0
+    },
+
+    "scene_guardpost": {
+      "body": "수비대원 두 명이 바리케이드 너머로 손전등을 비춘다. \"민간인? 여긴 위험 구역이다.\" 경계하는 눈빛이지만 적대적이진 않다.",
+      "isEnding": false,
+      "onEnter": [],
+      "choices": [
+        { "label": "가진 정보를 공유하며 협조한다", "to": "scene_hub", "condition": [],
+          "effects": [ { "type": "faction", "key": "defense", "delta": 10 }, { "type": "resource", "key": "food", "delta": -1 } ],
+          "hideWhenLocked": false },
+        { "label": "물자 지원을 요청한다 (신뢰가 필요하다)", "to": "scene_guard_help",
+          "condition": [ { "type": "faction", "key": "defense", "op": ">=", "value": 10 } ],
+          "effects": [], "hideWhenLocked": true }
+      ],
+      "posX": 260, "posY": 180
+    },
+
+    "scene_guard_help": {
+      "body": "대장이 고개를 끄덕인다. \"이 정도 도와줬으면 믿어볼 만하지.\" 필터와 관리실 카드키를 건네준다. \"지하 3층 통제실, 조심해서 써라.\"",
+      "isEnding": false,
+      "onEnter": [
+        { "type": "resource", "key": "filter", "delta": 1 },
+        { "type": "item", "key": "keycard", "delta": 1 },
+        { "type": "flag", "key": "found_secret", "value": true }
+      ],
+      "choices": [
+        { "label": "허브로 돌아간다", "to": "scene_hub", "condition": [], "effects": [], "hideWhenLocked": false }
+      ],
+      "posX": 520, "posY": 180
+    },
+
+    "scene_market": {
+      "body": "천막 아래, 등유 램프 불빛 속에서 한 상인이 손짓한다. \"뭐가 필요한가? 필터든 정보든, 대가만 맞으면.\"",
+      "isEnding": false,
+      "onEnter": [ { "type": "flag", "key": "met_merchant", "value": true } ],
+      "choices": [
+        { "label": "식량으로 필터를 산다", "to": "scene_hub",
+          "condition": [ { "type": "resource", "key": "food", "op": ">=", "value": 2 } ],
+          "effects": [ { "type": "resource", "key": "food", "delta": -2 }, { "type": "resource", "key": "filter", "delta": 1 }, { "type": "faction", "key": "market", "delta": 5 } ],
+          "hideWhenLocked": false },
+        { "label": "경비가 소홀한 틈에 정보를 훔친다", "to": "scene_hub", "condition": [],
+          "effects": [ { "type": "faction", "key": "market", "delta": -15 }, { "type": "stat", "key": "hp", "delta": -10 } ],
+          "hideWhenLocked": false }
+      ],
+      "posX": 0, "posY": 180
+    },
+
+    "scene_hub": {
+      "body": "여러 갈래 길이 모이는 환승 통로. 한쪽은 가스가 고인 긴 터널, 다른 쪽은 멀리 돌아가는 안전한 통로다.",
+      "isEnding": false,
+      "onEnter": [],
+      "choices": [
+        { "label": "방독면을 쓰고 가스 터널을 가로지른다", "to": "scene_tunnel",
+          "condition": [ { "type": "item", "key": "gasmask", "op": ">=", "value": 1 } ],
+          "effects": [ { "type": "stat", "key": "hp", "delta": -5 } ], "hideWhenLocked": true },
+        { "label": "멀리 돌아가는 안전한 통로로 간다", "to": "scene_bypass", "condition": [],
+          "effects": [ { "type": "resource", "key": "food", "delta": -1 } ], "hideWhenLocked": false }
+      ],
+      "posX": 260, "posY": 360
+    },
+
+    "scene_tunnel": {
+      "body": "숨소리가 마스크 안에서 거칠게 울린다. 몇 분을 버텨 반대편으로 빠져나왔다. 멀리 통제실 불빛이 보인다.",
+      "isEnding": false,
+      "onEnter": [],
+      "choices": [
+        { "label": "통제실로 향한다", "to": "scene_core", "condition": [], "effects": [], "hideWhenLocked": false }
+      ],
+      "posX": 520, "posY": 360
+    },
+
+    "scene_bypass": {
+      "body": "먼 길이지만 숨은 편하다. 걷는 동안 마음이 조금 가라앉는다.",
+      "isEnding": false,
+      "onEnter": [ { "type": "stat", "key": "sanity", "delta": 5 } ],
+      "choices": [
+        { "label": "통제실로 향한다", "to": "scene_core", "condition": [], "effects": [], "hideWhenLocked": false }
+      ],
+      "posX": 260, "posY": 540
+    },
+
+    "scene_core": {
+      "body": "중앙 통제실 앞. 여기서 다음을 정해야 한다 — 누구의 손을 잡을지, 아니면 아무도 믿지 않고 혼자 돌파할지.",
+      "isEnding": false,
+      "onEnter": [],
+      "choices": [
+        { "label": "수비대에 지원을 요청한다", "to": "ending_good_defense",
+          "condition": [ { "type": "faction", "key": "defense", "op": ">=", "value": 20 } ],
+          "effects": [], "hideWhenLocked": true },
+        { "label": "암시장에 거래를 제안한다", "to": "ending_good_market",
+          "condition": [ { "type": "faction", "key": "market", "op": ">=", "value": 20 } ],
+          "effects": [], "hideWhenLocked": true },
+        { "label": "관리실 카드키로 숨겨진 통로를 연다", "to": "ending_hidden",
+          "condition": [
+            { "type": "item", "key": "keycard", "op": ">=", "value": 1 },
+            { "type": "flag", "key": "found_secret", "value": true }
+          ],
+          "effects": [], "hideWhenLocked": true },
+        { "label": "아무도 믿지 않고 혼자 돌파한다", "to": "ending_lone", "condition": [],
+          "effects": [ { "type": "stat", "key": "hp", "delta": -30 }, { "type": "stat", "key": "sanity", "delta": -20 } ],
+          "hideWhenLocked": false }
+      ],
+      "posX": 520, "posY": 540
+    },
+
+    "ending_good_defense": {
+      "body": "수비대의 엄호 속에 지상으로 가는 길이 열린다. 믿음은 헛되지 않았다.",
+      "isEnding": true,
+      "endingName": "수비대와 함께",
+      "endingType": "good",
+      "choices": [],
+      "posX": 780, "posY": 400
+    },
+
+    "ending_good_market": {
+      "body": "암시장이 마련해 둔 뒷문으로 조용히 빠져나간다. 떳떳하진 않지만, 살아남았다.",
+      "isEnding": true,
+      "endingName": "암시장의 뒷문",
+      "endingType": "good",
+      "choices": [],
+      "posX": 780, "posY": 500
+    },
+
+    "ending_hidden": {
+      "body": "카드키가 걸쇠를 풀자, 아무도 모르던 비상 통로가 드러난다. 가장 조용한 탈출.",
+      "isEnding": true,
+      "endingName": "숨겨진 출구",
+      "endingType": "hidden",
+      "choices": [],
+      "posX": 780, "posY": 600
+    },
+
+    "ending_lone": {
+      "body": "누구의 도움도 없이 통로를 돌파했다. 몸은 만신창이지만, 어쨌든 살아는 있다.",
+      "isEnding": true,
+      "endingName": "홀로 돌파",
+      "endingType": "bad",
+      "choices": [],
+      "posX": 780, "posY": 700
+    },
+
+    "ending_dead": {
+      "body": "필터 없이 들이마신 가스가 폐를 태운다. 해정역은 또 하나의 이름 없는 무덤을 얻는다.",
+      "isEnding": true,
+      "endingName": "가스에 스러지다",
+      "endingType": "bad",
+      "choices": [],
+      "posX": 0, "posY": 700
+    },
+
+    "ending_mad": {
+      "body": "더는 무엇이 진짜인지 구분할 수 없다. 터널은 끝없이 이어지는 것처럼 느껴진다.",
+      "isEnding": true,
+      "endingName": "정신을 놓다",
+      "endingType": "bad",
+      "choices": [],
+      "posX": 0, "posY": 800
+    }
+  }
+}

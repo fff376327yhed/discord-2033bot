@@ -8,7 +8,7 @@
 //   4) PlayPreview      — 저장 전 미리보기 플레이
 //   5) SceneForm        — 장면 하나 편집(본문 + 선택지 카드)
 //   6) Editor (default) — 위 조각들을 조립하는 본체
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback, memo } from 'react';
 import { api, describeCondition, labelOf, startStory, advance, getAvailableChoices } from './lib.js';
 
 /* ═════════════════════════ 1) ConfigPanel ═════════════════════════ */
@@ -213,6 +213,7 @@ const NODE_W = 180, NODE_H = 70;
 function SceneGraph({ scenes, selected, onSelect, startSceneId, onMove, onAddAt }) {
   const canvasRef = useRef(null);
   const [dragging, setDragging] = useState(null); // { key, offsetX, offsetY }
+  const [dragPos, setDragPos] = useState(null); // 드래그 중엔 여기만 갱신(로컬) — 뗄 때 한 번만 부모로 commit
 
   useEffect(() => {
     if (!dragging) return;
@@ -220,9 +221,15 @@ function SceneGraph({ scenes, selected, onSelect, startSceneId, onMove, onAddAt 
       const rect = canvasRef.current.getBoundingClientRect();
       const x = e.clientX - rect.left + canvasRef.current.scrollLeft;
       const y = e.clientY - rect.top + canvasRef.current.scrollTop;
-      onMove(dragging.key, Math.max(0, Math.round(x - dragging.offsetX)), Math.max(0, Math.round(y - dragging.offsetY)));
+      setDragPos({ x: Math.max(0, Math.round(x - dragging.offsetX)), y: Math.max(0, Math.round(y - dragging.offsetY)) });
     }
-    function handleUp() { setDragging(null); }
+    function handleUp() {
+      setDragPos((pos) => {
+        if (pos) onMove(dragging.key, pos.x, pos.y); // 마지막 위치만 부모 state(scenes)에 1회 반영
+        return null;
+      });
+      setDragging(null);
+    }
     window.addEventListener('pointermove', handleMove);
     window.addEventListener('pointerup', handleUp);
     window.addEventListener('pointercancel', handleUp);
@@ -231,7 +238,7 @@ function SceneGraph({ scenes, selected, onSelect, startSceneId, onMove, onAddAt 
       window.removeEventListener('pointerup', handleUp);
       window.removeEventListener('pointercancel', handleUp);
     };
-  }, [dragging, onMove]);
+  }, [dragging, onMove]); // dragPos는 deps에서 제외 → 드래그 중 리스너 재등록 없음
 
   function onPointerDown(e, key) {
     const scene = scenes[key];
@@ -280,17 +287,22 @@ function SceneGraph({ scenes, selected, onSelect, startSceneId, onMove, onAddAt 
         })}
       </svg>
       <div className="graph-inner" style={{ position: 'relative', width, height }}>
-        {entries.map(([key, scene]) => (
-          <div
-            key={key}
-            className={`scene-node ${selected === key ? 'selected' : ''} ${scene.isEnding ? 'ending' : ''} ${key === startSceneId ? 'start-marker' : ''}`}
-            style={{ left: scene.posX ?? 0, top: scene.posY ?? 0 }}
-            onPointerDown={(e) => onPointerDown(e, key)}
-          >
-            <div className="title">{key === startSceneId ? '🚩 ' : ''}{scene.isEnding ? '🏁 ' : ''}{key}</div>
-            <div className="body-preview">{scene.body || '(본문 없음)'}</div>
-          </div>
-        ))}
+        {entries.map(([key, scene]) => {
+          const isDraggingThis = dragging?.key === key && dragPos;
+          const left = isDraggingThis ? dragPos.x : (scene.posX ?? 0);
+          const top = isDraggingThis ? dragPos.y : (scene.posY ?? 0);
+          return (
+            <div
+              key={key}
+              className={`scene-node ${selected === key ? 'selected' : ''} ${scene.isEnding ? 'ending' : ''} ${key === startSceneId ? 'start-marker' : ''}`}
+              style={{ left, top }}
+              onPointerDown={(e) => onPointerDown(e, key)}
+            >
+              <div className="title">{key === startSceneId ? '🚩 ' : ''}{scene.isEnding ? '🏁 ' : ''}{key}</div>
+              <div className="body-preview">{scene.body || '(본문 없음)'}</div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -667,6 +679,21 @@ function hasProblem(scene, scenes) {
   return choices.some((c) => !c.to || !scenes[c.to]);
 }
 
+// 사이드바 한 줄: scene 객체 레퍼런스가 안 바뀌면(= 다른 장면을 편집 중이면) 리렌더 스킵
+const ScenePageButton = memo(function ScenePageButton({ sceneKey, scene, pageNo, isStart, isCurrent, hasIssue, onSelect }) {
+  return (
+    <button type="button" className={`ed-page ${isCurrent ? 'active' : ''}`} onClick={() => onSelect(sceneKey)}>
+      <span className="ed-page-no">{pageNo}</span>
+      <span className="ed-page-text">{previewOf(scene, sceneKey)}</span>
+      <span className="ed-page-badges">
+        {isStart && <span title="시작 장면">🚩</span>}
+        {scene.isEnding && <span title="엔딩">🏁</span>}
+        {hasIssue && <span title="막다른 길이거나 끊긴 선택지가 있습니다">⚠️</span>}
+      </span>
+    </button>
+  );
+});
+
 export default function Editor({ storyId, onBack }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -685,6 +712,7 @@ export default function Editor({ storyId, onBack }) {
   const [search, setSearch] = useState('');
   const [sideOpen, setSideOpen] = useState(() => window.matchMedia(DESKTOP_QUERY).matches);
   const contentRef = useRef(null);
+  const importRef = useRef(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -725,14 +753,20 @@ export default function Editor({ storyId, onBack }) {
     return order.filter((key) => key.toLowerCase().includes(q) || String(scenes[key]?.body ?? '').toLowerCase().includes(q));
   }, [order, search, scenes]);
 
+  // ScenePageButton에 scenes 전체 대신 boolean만 넘기기 위한 사전 계산
+  const problemByKey = useMemo(
+    () => Object.fromEntries(order.map((key) => [key, hasProblem(scenes[key], scenes)])),
+    [order, scenes]
+  );
+
   function closeSideOnMobile() {
     if (!window.matchMedia(DESKTOP_QUERY).matches) setSideOpen(false);
   }
 
-  function selectScene(key) {
+  const selectScene = useCallback((key) => {
     setSelected(key);
-    closeSideOnMobile();
-  }
+    if (!window.matchMedia(DESKTOP_QUERY).matches) setSideOpen(false);
+  }, []);
 
   function updateScene(key, patch) {
     setScenes((prev) => ({ ...prev, [key]: { ...prev[key], ...patch } }));
@@ -812,6 +846,39 @@ export default function Editor({ storyId, onBack }) {
     }
   }
 
+  // JSON 파일(title/description/tags/config/scenes/startSceneId)을 읽어
+  // 현재 편집 중인 state를 통째로 덮어쓴다. 저장 버튼을 눌러야 서버에 실제 반영됨.
+  function handleImportFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!confirm(`'${file.name}' 내용으로 현재 편집 중인 스토리를 덮어쓸까요? (저장 전까지는 되돌릴 수 있습니다)`)) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!data.config || !data.scenes || !data.startSceneId) {
+          alert('config / scenes / startSceneId가 모두 있어야 합니다.');
+          return;
+        }
+        setMeta({
+          title: data.title ?? '',
+          description: data.description ?? '',
+          tags: Array.isArray(data.tags) ? data.tags : [],
+        });
+        setConfig(data.config);
+        setScenes(data.scenes);
+        setStartSceneId(data.startSceneId);
+        setSelected(data.startSceneId in data.scenes ? data.startSceneId : Object.keys(data.scenes)[0] ?? null);
+        setValidation(null);
+        setSaveMsg('불러왔습니다. 확인 후 저장을 눌러주세요.');
+      } catch (err) {
+        alert(`JSON을 읽지 못했습니다: ${err.message}`);
+      }
+    };
+    reader.readAsText(file, 'utf-8');
+  }
+
   if (loading) return <div style={{ padding: 20 }}>불러오는 중...</div>;
   if (error) return <div style={{ padding: 20 }}>⚠️ {error}</div>;
 
@@ -835,24 +902,18 @@ export default function Editor({ storyId, onBack }) {
 
         <div className="ed-pages">
           {visibleKeys.length === 0 && <div className="muted ed-pages-empty">검색 결과가 없습니다.</div>}
-          {visibleKeys.map((key) => {
-            const scene = scenes[key];
-            return (
-              <button
-                type="button" key={key}
-                className={`ed-page ${key === current ? 'active' : ''}`}
-                onClick={() => selectScene(key)}
-              >
-                <span className="ed-page-no">{pageOf[key]}</span>
-                <span className="ed-page-text">{previewOf(scene, key)}</span>
-                <span className="ed-page-badges">
-                  {key === startSceneId && <span title="시작 장면">🚩</span>}
-                  {scene.isEnding && <span title="엔딩">🏁</span>}
-                  {hasProblem(scene, scenes) && <span title="막다른 길이거나 끊긴 선택지가 있습니다">⚠️</span>}
-                </span>
-              </button>
-            );
-          })}
+          {visibleKeys.map((key) => (
+            <ScenePageButton
+              key={key}
+              sceneKey={key}
+              scene={scenes[key]}
+              pageNo={pageOf[key]}
+              isStart={key === startSceneId}
+              isCurrent={key === current}
+              hasIssue={problemByKey[key]}
+              onSelect={selectScene}
+            />
+          ))}
         </div>
 
         <div className="ed-side-foot">
@@ -874,6 +935,8 @@ export default function Editor({ storyId, onBack }) {
           </button>
           <div className="spacer" />
           {saveMsg && <span className="ed-msg" role="status">{saveMsg}</span>}
+          <button type="button" className="btn" onClick={() => importRef.current?.click()}>📂 불러오기</button>
+          <input type="file" accept=".json,application/json" ref={importRef} onChange={handleImportFile} style={{ display: 'none' }} />
           <button type="button" className="btn" onClick={() => setPreview(true)}>▶ 미리보기</button>
           <button type="button" className="btn btn-primary" disabled={saving} onClick={handleSave}>{saving ? '저장 중...' : '저장'}</button>
         </div>
