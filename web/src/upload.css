@@ -15,3 +15,18 @@
 .monitor-thumbs img { width: 64px; height: 64px; object-fit: cover; border-radius: 10px; border: 1px solid var(--border); display: block; }
 .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); animation: livepulse 1.6s ease-in-out infinite; }
 @keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+.gallery { margin-top: 8px; border: 1px solid var(--border); border-radius: 12px; padding: 8px; background: var(--panel2); }
+.gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 8px; }
+.gallery-item { position: relative; }
+.gallery-item .pick { display: block; width: 100%; padding: 0; border: 2px solid transparent; border-radius: 10px; overflow: hidden; background: var(--panel); }
+.gallery-item .pick.current { border-color: var(--accent); }
+.gallery-item img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; }
+.gallery-item .size { position: absolute; left: 4px; bottom: 4px; font-size: 10px; background: #000a; color: #fff; border-radius: 6px; padding: 1px 5px; }
+.gallery-item .del { position: absolute; right: 4px; top: 4px; width: 26px; height: 26px; border-radius: 50%; border: 0; background: #000a; color: #fff; font-size: 12px; line-height: 1; }
+.gallery-item .del:hover { background: var(--danger); }
+.monitor-thumbs .thumb { position: relative; }
+.monitor-thumbs .thumb .del { position: absolute; right: 2px; top: 2px; width: 22px; height: 22px; border-radius: 50%; border: 0; background: #000a; color: #fff; font-size: 11px; line-height: 1; }
+.monitor-thumbs .thumb .del:hover { background: var(--danger); }
+.monitor-warn { margin: 8px 0; padding: 8px 12px; border-radius: 10px; background: var(--warn-bg); color: var(--warn-fg); font-size: 13px; }
+.monitor-warn.danger { background: var(--bad-bg); color: var(--bad-fg); }
+.meter.small { height: 6px; margin-top: 4px; }

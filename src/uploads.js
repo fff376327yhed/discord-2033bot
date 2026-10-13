@@ -11,9 +11,13 @@ export const UPLOAD_LIMITS = {
   USER_MAX_FILE_BYTES: 800 * 1024,         // 일반 유저: 사진 한 장 최대 800KB (브라우저가 미리 줄여서 보낸다)
   USER_MAX_TOTAL_BYTES: 30 * 1024 * 1024,  // 일반 유저: 내 사진 전체 합계 최대 30MB
   USER_MAX_FILES: 60,                      // 일반 유저: 사진 최대 개수
+  USER_MAX_PER_MONTH: 40,                  // 일반 유저: 한 달에 올릴 수 있는 횟수 (Vercel Blob의 "고급 작업" 한도 보호)
   ADMIN_MAX_FILE_BYTES: 4_000_000,         // 관리자: 한 장 4MB (Vercel 요청 한도 4.5MB보다 작게)
   PLATFORM_BODY_BYTES: 4_500_000,          // Vercel 함수 요청 한도
   DEFAULT_STORAGE_LIMIT_MB: 1024,          // 관리자 화면 막대그래프의 기준(1GB). 환경 변수 UPLOAD_STORAGE_LIMIT_MB 로 바꾼다.
+  DEFAULT_MONTHLY_OPS_LIMIT: 2000,         // 한 달 업로드 총량의 기준(무료 한도 "Advanced Operations 2k"). 환경 변수 UPLOAD_MONTHLY_OPS_LIMIT 로 바꾼다. (확인 필요)
+  OPS_BLOCK_RATIO: 0.9,                    // 이번 달 총 업로드가 기준의 90%를 넘으면 일반 유저 업로드를 잠시 막는다 (관리자는 계속 가능)
+  STORAGE_BLOCK_RATIO: 0.95,               // 저장 용량이 기준의 95%를 넘으면 일반 유저 업로드를 잠시 막는다
 };
 
 const COL_UPLOADS = 'uploads';   // uploads/{UUID}  사진 한 장당 문서 하나
@@ -33,8 +37,16 @@ export function sniffImage(buf) {
   return null;
 }
 
-/** 올릴 수 있는지 판단한다. 문제가 없으면 null, 있으면 { status, message }. (순수 함수라 테스트하기 쉽다) */
-export function checkQuota({ usage, size, isAdmin, limits = UPLOAD_LIMITS }) {
+/** 이번 달 이름표. 예) "2026-10" (달이 바뀌면 횟수가 0부터 다시 시작) */
+export function monthKey(now = Date.now()) {
+  return new Date(now).toISOString().slice(0, 7);
+}
+
+/**
+ * 올릴 수 있는지 판단한다. 문제가 없으면 null, 있으면 { status, message }. (순수 함수라 테스트하기 쉽다)
+ * global: { bytes, limitBytes, opsMonthCount, opsLimit } 전체 사용 현황. 일반 유저만 이 안전장치에 걸린다.
+ */
+export function checkQuota({ usage, size, isAdmin, limits = UPLOAD_LIMITS, global = null }) {
   if (!(size > 0)) return { status: 400, message: '빈 파일입니다.' };
   if (isAdmin) {
     if (size > limits.ADMIN_MAX_FILE_BYTES) return { status: 413, message: '사진 한 장은 4MB까지만 올릴 수 있습니다. (Vercel 요청 한도)' };
@@ -43,12 +55,23 @@ export function checkQuota({ usage, size, isAdmin, limits = UPLOAD_LIMITS }) {
   if (size > limits.USER_MAX_FILE_BYTES) return { status: 413, message: `사진 한 장은 ${Math.floor(limits.USER_MAX_FILE_BYTES / 1024)}KB까지만 올릴 수 있습니다.` };
   if (usage.count >= limits.USER_MAX_FILES) return { status: 403, message: `사진은 최대 ${limits.USER_MAX_FILES}장까지 올릴 수 있습니다. 안 쓰는 사진을 지워 주세요.` };
   if (usage.bytes + size > limits.USER_MAX_TOTAL_BYTES) return { status: 403, message: `내 사진 저장 공간(${Math.floor(limits.USER_MAX_TOTAL_BYTES / 1024 / 1024)}MB)이 가득 찼습니다. 안 쓰는 사진을 지워 주세요.` };
+  if ((usage.monthCount ?? 0) >= limits.USER_MAX_PER_MONTH) return { status: 403, message: `이번 달 사진 올리기 횟수(${limits.USER_MAX_PER_MONTH}회)를 모두 썼습니다. 다음 달에 다시 올릴 수 있어요.` };
+  if (global) {
+    const full = global.limitBytes > 0 && global.bytes + size > global.limitBytes * limits.STORAGE_BLOCK_RATIO;
+    const busy = global.opsLimit > 0 && global.opsMonthCount >= global.opsLimit * limits.OPS_BLOCK_RATIO;
+    if (full || busy) return { status: 503, message: '사진 저장소가 거의 가득 차서 잠시 업로드를 막았습니다. 관리자에게 알려 주세요.' };
+  }
   return null;
 }
 
 export function storageLimitBytes(env = process.env) {
   const mb = Number(env.UPLOAD_STORAGE_LIMIT_MB);
   return (Number.isFinite(mb) && mb > 0 ? mb : UPLOAD_LIMITS.DEFAULT_STORAGE_LIMIT_MB) * 1024 * 1024;
+}
+
+export function monthlyOpsLimit(env = process.env) {
+  const n = Number(env.UPLOAD_MONTHLY_OPS_LIMIT);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : UPLOAD_LIMITS.DEFAULT_MONTHLY_OPS_LIMIT;
 }
 
 /**
@@ -76,6 +99,8 @@ export function registerUploadRoutes(deps, options = {}) {
     isAdmin,
     bytes: Number(snap?.get?.('uploadBytes')) || 0,
     count: Number(snap?.get?.('uploadCount')) || 0,
+    monthCount: snap?.get?.('uploadMonth') === monthKey() ? Number(snap?.get?.('uploadMonthCount')) || 0 : 0, // 이번 달에 올린 횟수
+    maxPerMonth: isAdmin ? null : UPLOAD_LIMITS.USER_MAX_PER_MONTH,
     maxBytes: isAdmin ? null : UPLOAD_LIMITS.USER_MAX_TOTAL_BYTES, // null = 제한 없음
     maxFiles: isAdmin ? null : UPLOAD_LIMITS.USER_MAX_FILES,
     maxFileBytes: isAdmin ? UPLOAD_LIMITS.ADMIN_MAX_FILE_BYTES : UPLOAD_LIMITS.USER_MAX_FILE_BYTES,
@@ -93,6 +118,15 @@ export function registerUploadRoutes(deps, options = {}) {
     const isAdmin = isAdminId(req.user.id);
     const snap = await getDb().collection(COL_USERS).doc(req.user.id).get();
     res.json({ usage: usageOf(snap, isAdmin) });
+  }));
+
+  // 내 사진 보관함: 최근 순으로 최대 100장 (다시 쓰거나 지울 때 쓴다)
+  router.get('/api/uploads/mine/items', requireAuth, wrap(async (req, res) => {
+    const snap = await getDb().collection(COL_UPLOADS).where('userId', '==', req.user.id).limit(100).get();
+    const items = snap.docs
+      .map((d) => ({ id: d.id, url: d.get('url'), size: Number(d.get('size')) || 0, createdAt: Number(d.get('createdAt')) || 0 }))
+      .sort((a, b) => b.createdAt - a.createdAt);
+    res.json({ items });
   }));
 
   // 사진 올리기: 본문이 사진 파일 그대로다. (Content-Type: image/webp 등)
@@ -113,12 +147,22 @@ export function registerUploadRoutes(deps, options = {}) {
     const size = buf.length;
 
     // 1) 먼저 "자리 예약". 동시에 여러 장을 올려도 한도를 못 넘게 트랜잭션으로 확인한다.
+    const month = monthKey();
+    const statsRef = db.collection(COL_META).doc(STATS_ID);
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(userRef);
+      const statsSnap = await tx.get(statsRef);
       const usage = usageOf(snap, isAdmin);
-      const problem = checkQuota({ usage, size, isAdmin });
+      const global = {
+        bytes: Math.max(0, Number(statsSnap.get?.('bytes')) || 0),
+        limitBytes: storageLimitBytes(),
+        opsMonthCount: statsSnap.get?.('opsMonth') === month ? Number(statsSnap.get?.('opsMonthCount')) || 0 : 0,
+        opsLimit: monthlyOpsLimit(),
+      };
+      const problem = checkQuota({ usage, size, isAdmin, global });
       if (problem) throw new HttpError(problem.status, problem.message, { usage });
-      tx.set(userRef, { uploadBytes: FieldValue.increment(size), uploadCount: FieldValue.increment(1) }, { merge: true });
+      tx.set(userRef, { uploadBytes: FieldValue.increment(size), uploadCount: FieldValue.increment(1), uploadMonth: month, uploadMonthCount: usage.monthCount + 1 }, { merge: true });
+      tx.set(statsRef, { opsMonth: month, opsMonthCount: global.opsMonthCount + 1 }, { merge: true });
     });
 
     // 2) 실제 저장. 실패하면 예약을 되돌린다.
@@ -130,7 +174,8 @@ export function registerUploadRoutes(deps, options = {}) {
       blobResult = await put(pathname, buf, { access: 'public', contentType: mime, addRandomSuffix: false, cacheControlMaxAge: 60 * 60 * 24 * 30 });
     } catch (err) {
       console.error('[uploads] Blob 저장 실패', err);
-      await userRef.set({ uploadBytes: FieldValue.increment(-size), uploadCount: FieldValue.increment(-1) }, { merge: true }).catch(() => {});
+      await userRef.set({ uploadBytes: FieldValue.increment(-size), uploadCount: FieldValue.increment(-1), uploadMonthCount: FieldValue.increment(-1) }, { merge: true }).catch(() => {});
+      await statsRef.set({ opsMonthCount: FieldValue.increment(-1) }, { merge: true }).catch(() => {});
       throw new HttpError(502, '사진 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.');
     }
 
@@ -191,6 +236,8 @@ export function registerUploadRoutes(deps, options = {}) {
       totalBytes,
       totalCount: Math.max(0, Number(statsSnap.get?.('count')) || 0),
       limitBytes: storageLimitBytes(),
+      opsMonthCount: statsSnap.get?.('opsMonth') === monthKey() ? Math.max(0, Number(statsSnap.get?.('opsMonthCount')) || 0) : 0,
+      opsLimit: monthlyOpsLimit(),
       syncedAt: Number(statsSnap.get?.('syncedAt')) || null,
       serverTime: Date.now(),
       topUsers: topSnap.docs
@@ -212,7 +259,7 @@ export function registerUploadRoutes(deps, options = {}) {
       if (!result.hasMore) break;
       cursor = result.cursor;
     }
-    await getDb().collection(COL_META).doc(STATS_ID).set({ bytes, count, updatedAt: Date.now(), syncedAt: Date.now() });
+    await getDb().collection(COL_META).doc(STATS_ID).set({ bytes, count, updatedAt: Date.now(), syncedAt: Date.now() }, { merge: true }); // 이번 달 횟수는 그대로 둔다
     res.json({ ok: true, totalBytes: bytes, totalCount: count });
   }));
 }

@@ -70,6 +70,7 @@ async function request(path, { method = 'GET', body, contentType } = {}) {
 
 export const uploadApi = {
   mine: () => request('/uploads/mine'),
+  myItems: () => request('/uploads/mine/items'),
   upload: (blob) => request('/uploads', { method: 'POST', body: blob, contentType: blob.type }),
   remove: (id) => request(`/uploads/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   adminStats: () => request('/admin/upload-stats'),

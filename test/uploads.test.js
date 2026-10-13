@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
-import { registerUploadRoutes, sniffImage, checkQuota, UPLOAD_LIMITS } from '../src/uploads.js';
+import { registerUploadRoutes, sniffImage, checkQuota, monthKey, UPLOAD_LIMITS } from '../src/uploads.js';
 
 process.env.BLOB_READ_WRITE_TOKEN = 'test-token';
 process.env.ADMIN_DISCORD_IDS = '999999999999';
@@ -36,7 +36,13 @@ function makeDb() {
   });
   return {
     store,
-    collection: (name) => ({ doc: (id) => ref(`${name}/${id}`), orderBy: (f, d) => query(name, f, d) }),
+    collection: (name) => ({
+      doc: (id) => ref(`${name}/${id}`),
+      orderBy: (f, d) => query(name, f, d),
+      where: (field, op, value) => ({
+        limit: (n) => ({ get: async () => ({ docs: [...store.keys()].filter((p) => p.startsWith(`${name}/`) && store.get(p)[field] === value).slice(0, n).map(snap) }) }),
+      }),
+    }),
     runTransaction: async (fn) => {
       const ops = [];
       const tx = { ...writer(ops), get: async (r) => snap(r.path) };
@@ -143,5 +149,55 @@ test('남의 사진은 못 지우고, 관리자 사용량 주소는 관리자만
     assert.equal(stats.recent.length, 1);
     const sync = await (await fetch(`${ctx.base}/api/admin/upload-stats/resync`, { method: 'POST', headers: { 'x-test-user': '999999999999' } })).json();
     assert.equal(sync.totalBytes, 500);
+  } finally { ctx.server.close(); }
+});
+
+test('checkQuota: 이번 달 횟수 초과 / 저장소 거의 가득 / 이번 달 총 업로드 많음', () => {
+  const usage = { bytes: 0, count: 0, monthCount: UPLOAD_LIMITS.USER_MAX_PER_MONTH };
+  assert.equal(checkQuota({ usage, size: 10, isAdmin: false }).status, 403);
+  assert.equal(checkQuota({ usage, size: 10, isAdmin: true }), null);
+  const ok = { bytes: 0, count: 0, monthCount: 0 };
+  const full = { bytes: 960, limitBytes: 1000, opsMonthCount: 0, opsLimit: 2000 };
+  assert.equal(checkQuota({ usage: ok, size: 10, isAdmin: false, global: full }).status, 503);
+  assert.equal(checkQuota({ usage: ok, size: 10, isAdmin: true, global: full }), null);
+  const busy = { bytes: 0, limitBytes: 1000, opsMonthCount: 1800, opsLimit: 2000 };
+  assert.equal(checkQuota({ usage: ok, size: 10, isAdmin: false, global: busy }).status, 503);
+});
+
+test('이번 달 횟수를 다 쓴 유저는 막히고, 지난달 기록은 0부터 다시 센다', async () => {
+  const ctx = await start();
+  try {
+    ctx.db.store.set('users/111111111111', { uploadMonth: monthKey(), uploadMonthCount: UPLOAD_LIMITS.USER_MAX_PER_MONTH });
+    assert.equal((await send(ctx, '111111111111', webp(500))).status, 403);
+    ctx.db.store.set('users/111111111111', { uploadMonth: '2020-01', uploadMonthCount: 999 });
+    const res = await send(ctx, '111111111111', webp(500));
+    assert.equal(res.status, 201);
+    assert.equal((await res.json()).usage.monthCount, 1);
+    assert.equal(ctx.db.store.get('meta/uploadStats').opsMonthCount, 1);
+  } finally { ctx.server.close(); }
+});
+
+test('저장소가 거의 차면 일반 유저는 막히고 관리자는 올릴 수 있다', async () => {
+  const ctx = await start();
+  try {
+    ctx.db.store.set('meta/uploadStats', { bytes: 1000 * 1024 * 1024, count: 100 }); // 기준 1GB(1024MB) 중 약 98%
+    assert.equal((await send(ctx, '111111111111', webp(500))).status, 503);
+    assert.equal((await send(ctx, '999999999999', webp(500))).status, 201);
+  } finally { ctx.server.close(); }
+});
+
+test('내 사진 보관함: 내 것만, 최근 순으로 나온다. 다시 계산해도 이번 달 횟수는 남는다', async () => {
+  const ctx = await start();
+  try {
+    await send(ctx, '111111111111', webp(500));
+    await send(ctx, '222222222222', webp(600));
+    const mine = await (await fetch(`${ctx.base}/api/uploads/mine/items`, { headers: { 'x-test-user': '111111111111' } })).json();
+    assert.equal(mine.items.length, 1);
+    assert.equal(mine.items[0].size, 500);
+    await fetch(`${ctx.base}/api/admin/upload-stats/resync`, { method: 'POST', headers: { 'x-test-user': '999999999999' } });
+    assert.equal(ctx.db.store.get('meta/uploadStats').opsMonthCount, 2);
+    const stats = await (await fetch(`${ctx.base}/api/admin/upload-stats`, { headers: { 'x-test-user': '999999999999' } })).json();
+    assert.equal(stats.opsMonthCount, 2);
+    assert.equal(stats.opsLimit, 2000);
   } finally { ctx.server.close(); }
 });

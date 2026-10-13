@@ -218,7 +218,7 @@ describe('메시지 만들기', () => {
     const first = message.components[0].components[0];
     assert.equal(first.disabled, true);
     assert.ok(first.label.startsWith('🔒'));
-    const lockedField = message.embeds[0].fields.find((field) => field.name === '잠긴 선택지');
+    const lockedField = message.embeds[0].fields.find((field) => field.name === '잠김');
     assert.ok(lockedField.value.includes('방독면 필요'));
   });
 
@@ -1543,21 +1543,21 @@ describe('봇 공개 메시지와 채널 제한', () => {
     }
   }
 
-  test('기본은 모두에게 보이는 메시지(flags 없음), 멘션은 항상 차단', async () => {
+  test('기본은 모두에게 보이는 메시지(알림 없이 조용히, 4096), 멘션은 항상 차단', async () => {
     await withEnv({ DISCORD_EPHEMERAL: undefined }, () => {
       const res = reply({ content: '안녕' });
       assert.equal(res.type, 4);
-      assert.equal(res.data.flags, undefined);
+      assert.equal(res.data.flags, 4096); // 조용한 알림(SUPPRESS_NOTIFICATIONS)만 붙는다
       assert.deepEqual(res.data.allowed_mentions, { parse: [] });
     });
   });
 
   test('DISCORD_EPHEMERAL=true 면 예전처럼 본인에게만 보인다', async () => {
     await withEnv({ DISCORD_EPHEMERAL: 'true' }, () => {
-      assert.equal(reply({ content: 'x' }).data.flags, 64);
+      assert.equal(reply({ content: 'x' }).data.flags, 4096 | 64); // 조용한 알림 + 본인에게만
     });
     await withEnv({ DISCORD_EPHEMERAL: 'false' }, () => {
-      assert.equal(reply({ content: 'x' }).data.flags, undefined);
+      assert.equal(reply({ content: 'x' }).data.flags, 4096);
     });
   });
 
