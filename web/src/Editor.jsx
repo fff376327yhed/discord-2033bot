@@ -530,7 +530,7 @@ function EntryList({ label, list, config, kind, onChange }) {
 
 /* ───────── 선택지 카드 ───────── */
 
-function ChoiceCard({ choice, index, scenes, order, pageOf, config, onChange, onRemove, onGoto }) {
+function ChoiceCard({ choice, index, isFirst, isLast, scenes, order, pageOf, config, onChange, onRemove, onMove, onGoto }) {
   const target = choice.to && scenes[choice.to] ? choice.to : '';
   const missing = choice.to && !scenes[choice.to];
   return (
@@ -541,6 +541,8 @@ function ChoiceCard({ choice, index, scenes, order, pageOf, config, onChange, on
           placeholder={`선택지 ${index + 1} 문구 (버튼에 표시됩니다)`}
           onChange={(e) => onChange({ ...choice, label: e.target.value })}
         />
+        <button type="button" className="icon-btn" disabled={isFirst} onClick={() => onMove(-1)} title="위로 올리기" aria-label="선택지 위로">↑</button>
+        <button type="button" className="icon-btn" disabled={isLast} onClick={() => onMove(1)} title="아래로 내리기" aria-label="선택지 아래로">↓</button>
         <button type="button" className="icon-btn" onClick={onRemove} title="이 선택지 삭제" aria-label="이 선택지 삭제">🗑</button>
       </div>
 
@@ -569,12 +571,19 @@ function ChoiceCard({ choice, index, scenes, order, pageOf, config, onChange, on
 
 /* ───────── 장면 전체 ───────── */
 
-function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, config, onChange, onDelete, onSetStart, onGoto }) {
+function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, config, onChange, onDelete, onDuplicate, onSetStart, onGoto }) {
   const choices = scene.choices ?? [];
   const isStart = sceneKey === startSceneId;
 
   function updateChoice(i, choice) { const next = [...choices]; next[i] = choice; onChange({ choices: next }); }
   function removeChoice(i) { onChange({ choices: choices.filter((_, idx) => idx !== i) }); }
+  function moveChoice(i, dir) {
+    const j = i + dir;
+    if (j < 0 || j >= choices.length) return;
+    const next = [...choices];
+    [next[i], next[j]] = [next[j], next[i]];
+    onChange({ choices: next });
+  }
   function addChoice() {
     if (choices.length >= LIMITS.CHOICES) { alert(`선택지는 최대 ${LIMITS.CHOICES}개까지 가능합니다.`); return; }
     onChange({ choices: [...choices, { label: '', to: '', condition: [], effects: [], hideWhenLocked: false }] });
@@ -589,6 +598,7 @@ function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, confi
         {scene.isEnding && <span className="badge end">🏁 엔딩</span>}
         <span className="spacer" />
         {!isStart && <button type="button" className="btn btn-small" onClick={onSetStart}>🚩 시작 장면으로</button>}
+        <button type="button" className="btn btn-small" onClick={onDuplicate} title="이 장면을 똑같이 복제">복제</button>
         <button type="button" className="btn btn-small btn-danger-outline" onClick={onDelete}>삭제</button>
       </div>
 
@@ -640,8 +650,8 @@ function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, confi
           {choices.length === 0 && <div className="warn-box">⚠️ 선택지가 없습니다. 엔딩이 아니라면 막다른 길이라 공개할 수 없어요.</div>}
           {choices.map((choice, i) => (
             <ChoiceCard
-              key={i} choice={choice} index={i} scenes={scenes} order={order} pageOf={pageOf} config={config}
-              onChange={(c) => updateChoice(i, c)} onRemove={() => removeChoice(i)} onGoto={onGoto}
+              key={i} choice={choice} index={i} isFirst={i === 0} isLast={i === choices.length - 1} scenes={scenes} order={order} pageOf={pageOf} config={config}
+              onChange={(c) => updateChoice(i, c)} onRemove={() => removeChoice(i)} onMove={(dir) => moveChoice(i, dir)} onGoto={onGoto}
             />
           ))}
           <button type="button" className="add-pill" onClick={addChoice} aria-label="선택지 추가">+ 선택지 추가</button>
@@ -695,6 +705,98 @@ const ScenePageButton = memo(function ScenePageButton({ sceneKey, scene, pageNo,
   );
 });
 
+// ───── 되돌리기 / 저장 기록 / 내보내기·가져오기 도우미 ─────
+const HISTORY_MAX_STEPS = 100; // 되돌리기 최대 단계
+const HISTORY_BURST_MS = 800;  // 이 시간 안의 연속 입력은 한 단계로 묶는다
+const newHist = () => ({ past: [], future: [], stable: null, burst: false, timer: null, expect: null });
+const sameSnap = (a, b) => a.meta === b.meta && a.config === b.config && a.scenes === b.scenes && a.startSceneId === b.startSceneId;
+
+function stripIds(scenes) {
+  const out = {};
+  for (const [key, scene] of Object.entries(scenes)) {
+    const { id, ...rest } = scene;
+    out[key] = rest;
+  }
+  return out;
+}
+const toStoryData = (snap) => ({ meta: snap.meta, config: snap.config, startSceneId: snap.startSceneId, scenes: stripIds(snap.scenes) });
+
+// 저장 기록: 이 브라우저(localStorage)에만 남는다. 서버에는 올라가지 않는다.
+const HIST_KEY = (storyId) => `haejung-hist:${storyId}`;
+const HIST_MAX = 15;                 // 스토리마다 최근 15개
+const HIST_GAP_MS = 5 * 60 * 1000;   // 자동 저장은 5분에 한 번만 기록 (수동 저장·충돌·가져오기는 항상 기록)
+const HIST_MAX_BYTES = 400 * 1024;   // 한 개가 이보다 크면 기록을 건너뜀
+
+function readHistory(storyId) {
+  try {
+    const list = JSON.parse(localStorage.getItem(HIST_KEY(storyId)) || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function pushHistory(storyId, snap, force) {
+  try {
+    const list = readHistory(storyId);
+    const last = list[list.length - 1];
+    const data = toStoryData(snap);
+    if (last && JSON.stringify(last.data) === JSON.stringify(data)) return; // 내용이 같으면 중복 기록 안 함
+    if (!force && last && Date.now() - last.at < HIST_GAP_MS) return;
+    const entry = { at: Date.now(), data };
+    if (JSON.stringify(entry).length > HIST_MAX_BYTES) return;
+    list.push(entry);
+    while (list.length > HIST_MAX) list.shift();
+    for (;;) {
+      try {
+        localStorage.setItem(HIST_KEY(storyId), JSON.stringify(list));
+        return;
+      } catch {
+        if (list.length <= 1) return; // 저장 공간이 부족하면 오래된 것부터 버린다
+        list.shift();
+      }
+    }
+  } catch {
+    /* localStorage 를 못 쓰는 환경이면 조용히 건너뜀 */
+  }
+}
+
+/** 내보낸 JSON 파일(또는 저장 기록)이 쓸 수 있는 모양인지 확인한다. 세부 검증은 저장할 때 서버가 한다. */
+function parseStoryJson(text) {
+  let data;
+  try { data = JSON.parse(text); } catch { return { error: 'JSON 파일이 아니에요.' }; }
+  if (!data || typeof data !== 'object' || !data.scenes || typeof data.scenes !== 'object' || Array.isArray(data.scenes)) {
+    return { error: '이 앱에서 내보낸 스토리 파일이 아니에요. (scenes 없음)' };
+  }
+  const entries = Object.entries(data.scenes);
+  if (entries.length === 0) return { error: '장면이 하나도 없어요.' };
+  if (entries.some(([, scene]) => !scene || typeof scene !== 'object' || Array.isArray(scene))) {
+    return { error: '장면 데이터가 올바르지 않아요.' };
+  }
+  return { data };
+}
+
+function HistoryPanel({ storyId, onRestore }) {
+  const [entries] = useState(() => readHistory(storyId).slice().reverse());
+  return (
+    <div>
+      <p className="muted" style={{ fontSize: 13, margin: '0 0 8px' }}>
+        저장할 때마다 이 브라우저에 최근 {HIST_MAX}개까지 기록돼요. 다른 기기나 브라우저에서는 보이지 않아요.
+      </p>
+      {entries.length === 0 && <div className="muted">아직 기록이 없어요.</div>}
+      {entries.map((entry, i) => (
+        <div key={`${entry.at}-${i}`} className="monitor-row" style={{ alignItems: 'center' }}>
+          <span>
+            {new Date(entry.at).toLocaleString('ko-KR')}
+            <span className="muted"> · 장면 {Object.keys(entry.data.scenes ?? {}).length}개 · {entry.data.meta?.title || '(제목 없음)'}</span>
+          </span>
+          <button type="button" className="btn btn-small" onClick={() => onRestore(entry)}>복원</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function Editor({ storyId, onBack }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -722,6 +824,10 @@ export default function Editor({ storyId, onBack }) {
   const conflictRef = useRef(false);  // 409(충돌) 후에는 자동 저장 중지
   const [saveTick, setSaveTick] = useState(0); // 저장이 끝난 뒤 변경분이 있는지 다시 확인시키는 용도
   latestRef.current = { meta, config, scenes, startSceneId };
+  const histRef = useRef(newHist());          // 되돌리기/다시하기 스택
+  const [, setHistTick] = useState(0);        // 되돌리기 버튼 활성/비활성 갱신용
+  const [conflict, setConflict] = useState(false);
+  const importRef = useRef(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -739,6 +845,11 @@ export default function Editor({ storyId, onBack }) {
         savedRef.current = { meta: loadedMeta, config: story.config, scenes: loadedScenes, startSceneId: story.startSceneId };
         baseRef.current = story.updatedAt;
         conflictRef.current = false;
+        setConflict(false);
+        clearTimeout(histRef.current.timer);
+        histRef.current = newHist();
+        setHistTick((t) => t + 1);
+        pushHistory(storyId, savedRef.current, true); // 열었을 때의 서버 내용을 기록으로 남김
       })
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
@@ -799,6 +910,20 @@ export default function Editor({ storyId, onBack }) {
     closeSideOnMobile();
   }
 
+  function duplicateScene(key) {
+    const src = scenes[key];
+    if (!src) return;
+    const nextKey = newSceneKey(scenes);
+    const copy = JSON.parse(JSON.stringify(src)); // 선택지·조건·효과까지 완전히 독립된 복사본
+    copy.id = nextKey;
+    copy.posX = (src.posX ?? 0) + 40; // 구조도에서 원본 위에 겹치지 않게 살짝 옮긴다
+    copy.posY = (src.posY ?? 0) + 40;
+    setScenes((prev) => ({ ...prev, [nextKey]: copy }));
+    setSelected(nextKey);
+    setSearch('');
+    setSaveMsg(`P.${pageOf[key]} 장면을 복제했어요.`);
+  }
+
   function deleteScene(key) {
     if (key === startSceneId) { alert('시작 장면은 삭제할 수 없습니다. 먼저 다른 장면을 시작 장면으로 바꿔주세요.'); return; }
     if (!confirm(`P.${pageOf[key]} '${key}' 장면을 삭제할까요? 이 장면을 가리키던 선택지는 연결이 끊어집니다.`)) return;
@@ -838,11 +963,14 @@ export default function Editor({ storyId, onBack }) {
       savedRef.current = snap;
       setValidation(result.validation);
       setSaveMsg(auto ? `자동 저장됨 · ${new Date().toLocaleTimeString('ko-KR')}` : '저장했습니다.');
+      pushHistory(storyId, snap, !auto);
       setSaveTick((t) => t + 1); // 저장 중에 또 고친 내용이 있으면 다시 예약
       return true;
     } catch (err) {
       if (err.status === 409) {
         conflictRef.current = true;
+        setConflict(true);
+        pushHistory(storyId, snap, true); // 충돌이 나도 내 내용은 저장 기록에 남겨 둔다
         setSaveMsg(auto ? '다른 곳에서 먼저 수정되어 자동 저장을 멈췄어요. 새로고침 후 다시 시도하세요.' : '다른 곳에서 먼저 수정되었습니다. 새로고침 후 다시 시도하세요.');
       } else if (err.status === 422) {
         setValidation(err.validation);
@@ -884,6 +1012,148 @@ export default function Editor({ storyId, onBack }) {
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── 되돌리기 / 다시하기 ──
+  function applySnapshot(snap) {
+    const h = histRef.current;
+    clearTimeout(h.timer);
+    h.burst = false;
+    h.expect = snap;
+    setMeta(snap.meta);
+    setConfig(snap.config);
+    setScenes(snap.scenes);
+    setStartSceneId(snap.startSceneId);
+    setSelected((cur) => (snap.scenes[cur] ? cur : (snap.startSceneId in snap.scenes ? snap.startSceneId : Object.keys(snap.scenes)[0] ?? null)));
+    setHistTick((t) => t + 1);
+  }
+
+  // 가져오기·복원처럼 큰 작업은 직전 입력과 한 단계로 묶이지 않도록, 진행 중인 묶음을 먼저 닫는다
+  function closeHistBurst() {
+    const h = histRef.current;
+    clearTimeout(h.timer);
+    h.stable = latestRef.current;
+    h.burst = false;
+  }
+
+  function undo() {
+    const h = histRef.current;
+    if (h.past.length === 0) return;
+    const cur = h.expect ?? latestRef.current;
+    h.future.push(cur);
+    applySnapshot(h.past.pop());
+  }
+
+  function redo() {
+    const h = histRef.current;
+    if (h.future.length === 0) return;
+    const cur = h.expect ?? latestRef.current;
+    h.past.push(cur);
+    applySnapshot(h.future.pop());
+  }
+
+  // 편집 내용이 바뀌면 "바뀌기 직전 상태"를 되돌리기 스택에 넣는다 (연속 입력은 한 단계로 묶음)
+  useEffect(() => {
+    if (loading) return;
+    const h = histRef.current;
+    const cur = { meta, config, scenes, startSceneId };
+    if (!h.stable || (h.expect && sameSnap(h.expect, cur))) { h.stable = cur; h.expect = null; return; } // 불러오기/되돌리기 결과는 기록하지 않음
+    if (sameSnap(h.stable, cur)) return;
+    h.expect = null;
+    if (!h.burst) {
+      h.past.push(h.stable);
+      if (h.past.length > HISTORY_MAX_STEPS) h.past.shift();
+      h.future = [];
+      h.burst = true;
+      setHistTick((t) => t + 1);
+    }
+    clearTimeout(h.timer);
+    h.timer = setTimeout(() => { h.stable = latestRef.current; h.burst = false; }, HISTORY_BURST_MS);
+  }, [loading, meta, config, scenes, startSceneId]);
+
+  // 단축키: Ctrl/Cmd + S 저장, Ctrl/Cmd + Z 되돌리기, Ctrl/Cmd + Shift + Z (또는 Y) 다시하기
+  useEffect(() => {
+    function onKey(e) {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === 's') { e.preventDefault(); save({ auto: false }); }
+      else if (k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+      else if ((k === 'z' && e.shiftKey) || k === 'y') { e.preventDefault(); redo(); }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      clearTimeout(histRef.current.timer);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── 내보내기 / 가져오기 ──
+  function exportJson() {
+    const snap = latestRef.current;
+    const data = { format: 'haejung-story', version: 1, exportedAt: new Date().toISOString(), ...toStoryData(snap) };
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+    const name = (snap.meta.title || 'story').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${name}-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function applyStoryData(data) {
+    const nextScenes = {};
+    for (const [key, scene] of Object.entries(data.scenes)) nextScenes[key] = { ...scene, id: key };
+    const start = data.startSceneId in nextScenes ? data.startSceneId : Object.keys(nextScenes)[0];
+    const m = data.meta ?? {};
+    setMeta({
+      title: String(m.title ?? '').slice(0, 50),
+      description: String(m.description ?? '').slice(0, 500),
+      tags: Array.isArray(m.tags) ? m.tags.filter((t) => typeof t === 'string').slice(0, 5) : [],
+    });
+    setConfig({ stats: {}, resources: {}, factions: {}, items: {}, flags: {}, startInventory: {}, ...(data.config && typeof data.config === 'object' ? data.config : {}) });
+    setScenes(nextScenes);
+    setStartSceneId(start);
+    setSelected(start);
+    setSearch('');
+  }
+
+  async function handleImportFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // 같은 파일을 다시 골라도 동작하도록 비운다
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) { alert('파일이 너무 커요. (5MB 이하만 가능)'); return; }
+    const parsed = parseStoryJson(await file.text());
+    if (parsed.error) { alert(`가져오기 실패: ${parsed.error}`); return; }
+    const n = Object.keys(parsed.data.scenes).length;
+    if (!confirm(`현재 편집 중인 내용을 이 파일(장면 ${n}개)로 바꿀까요?\n되돌리기(Ctrl+Z)로 취소할 수 있어요.`)) return;
+    pushHistory(storyId, latestRef.current, true);
+    closeHistBurst();
+    applyStoryData(parsed.data);
+    closeSideOnMobile();
+    setSaveMsg(isPublic ? '파일을 가져왔어요. [저장]을 눌러야 반영돼요.' : '파일을 가져왔어요. 곧 자동 저장돼요.');
+  }
+
+  function restoreFromHistory(entry) {
+    if (!confirm(`${new Date(entry.at).toLocaleString('ko-KR')} 시점으로 복원할까요?\n지금 내용은 기록에 남기고, 되돌리기(Ctrl+Z)로도 취소할 수 있어요.`)) return;
+    const parsed = parseStoryJson(JSON.stringify(entry.data));
+    if (parsed.error) { alert(`복원 실패: ${parsed.error}`); return; }
+    pushHistory(storyId, latestRef.current, true);
+    closeHistBurst();
+    applyStoryData(parsed.data);
+    setPanel(null);
+    setSaveMsg(isPublic ? '복원했어요. [저장]을 눌러야 반영돼요.' : '복원했어요. 곧 자동 저장돼요.');
+  }
+
+  // 충돌(409) 후: 서버의 최신 내용으로 다시 시작
+  function reloadFromServer() {
+    if (!confirm('서버에 저장된 최신 내용을 불러오면 지금 편집 중인 내용은 화면에서 사라져요.\n(내 내용은 🕘 저장 기록에도 남아 있어요.) 계속할까요?')) return;
+    pushHistory(storyId, latestRef.current, true);
+    load();
+  }
 
   async function handleVisibility(next) {
     try {
@@ -952,6 +1222,10 @@ export default function Editor({ storyId, onBack }) {
             {validation && <span className={`dot ${validation.ok ? 'ok' : 'bad'}`} />}
           </button>
           <button type="button" onClick={() => setPanel('settings')}>⚙ 스토리 설정</button>
+          <button type="button" onClick={() => setPanel('history')}>🕘 저장 기록</button>
+          <button type="button" onClick={exportJson}>📤 파일로 내보내기</button>
+          <button type="button" onClick={() => importRef.current?.click()}>📥 파일에서 가져오기</button>
+          <input ref={importRef} type="file" accept="application/json,.json" hidden onChange={handleImportFile} />
         </div>
       </aside>
       <div className="ed-scrim" onClick={() => setSideOpen(false)} />
@@ -962,9 +1236,17 @@ export default function Editor({ storyId, onBack }) {
           <button type="button" className="icon-btn" onClick={() => setSideOpen((v) => !v)} title="페이지 목록 열기/닫기" aria-label="페이지 목록 열기/닫기">
             {sideOpen ? '«' : '☰'}
           </button>
+          <button type="button" className="icon-btn" onClick={undo} disabled={histRef.current.past.length === 0} title="되돌리기 (Ctrl+Z)" aria-label="되돌리기">↶</button>
+          <button type="button" className="icon-btn" onClick={redo} disabled={histRef.current.future.length === 0} title="다시 실행 (Ctrl+Shift+Z)" aria-label="다시 실행">↷</button>
           <div className="spacer" />
           {isPublic && !saveMsg && <span className="ed-msg muted">공개 중이라 자동 저장이 꺼져 있어요</span>}
           {saveMsg && <span className="ed-msg" role="status">{saveMsg}</span>}
+          {conflict && (
+            <>
+              <button type="button" className="btn btn-small" onClick={exportJson}>내 내용 내려받기</button>
+              <button type="button" className="btn btn-small btn-danger-outline" onClick={reloadFromServer}>서버 내용 불러오기</button>
+            </>
+          )}
           <button type="button" className="btn" onClick={() => setPreview(true)}>▶ 미리보기</button>
           <button type="button" className="btn btn-primary" disabled={saving} onClick={handleSave}>{saving ? '저장 중...' : '저장'}</button>
         </div>
@@ -977,6 +1259,7 @@ export default function Editor({ storyId, onBack }) {
               order={order} pageOf={pageOf} startSceneId={startSceneId} config={config}
               onChange={(patch) => updateScene(current, patch)}
               onDelete={() => deleteScene(current)}
+              onDuplicate={() => duplicateScene(current)}
               onSetStart={() => setStartSceneId(current)}
               onGoto={selectScene}
             />
@@ -995,7 +1278,7 @@ export default function Editor({ storyId, onBack }) {
         <div className="modal-backdrop" onClick={() => setPanel(null)}>
           <div className={`modal ${panel === 'graph' ? 'wide' : ''}`} onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
-              <strong>{panel === 'settings' ? '스토리 설정' : panel === 'validation' ? '유효성 검사' : '구조도'}</strong>
+              <strong>{panel === 'settings' ? '스토리 설정' : panel === 'validation' ? '유효성 검사' : panel === 'history' ? '저장 기록' : '구조도'}</strong>
               <button type="button" className="icon-btn" onClick={() => setPanel(null)} aria-label="닫기">✕</button>
             </div>
 
@@ -1004,6 +1287,9 @@ export default function Editor({ storyId, onBack }) {
             )}
             {panel === 'validation' && (
               <ValidationPanel config={config} scenes={scenes} startSceneId={startSceneId} validation={validation} setValidation={setValidation} />
+            )}
+            {panel === 'history' && (
+              <HistoryPanel storyId={storyId} onRestore={restoreFromHistory} />
             )}
             {panel === 'graph' && (
               <>
