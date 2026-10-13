@@ -69,6 +69,32 @@ export function storageLimitBytes(env = process.env) {
   return (Number.isFinite(mb) && mb > 0 ? mb : UPLOAD_LIMITS.DEFAULT_STORAGE_LIMIT_MB) * 1024 * 1024;
 }
 
+/**
+ * Blob 열쇠(토큰)를 찾는다. 기본 이름은 BLOB_READ_WRITE_TOKEN 이지만,
+ * Vercel에서 스토어를 연결할 때 "접두어(Prefix)"를 바꾸면 이름이 MYSTORE_READ_WRITE_TOKEN 처럼 달라진다.
+ * 그래서 이름이 _READ_WRITE_TOKEN 으로 끝나는 변수도 찾아 준다. 없으면 undefined.
+ */
+export function findBlobToken(env = process.env) {
+  if (env.BLOB_READ_WRITE_TOKEN) return env.BLOB_READ_WRITE_TOKEN;
+  const key = Object.keys(env).find((name) => /_READ_WRITE_TOKEN$/.test(name) && env[name]);
+  return key ? env[key] : undefined;
+}
+
+/**
+ * Blob에 접속할 방법이 있는지 본다.
+ * (1) 열쇠 방식: BLOB_READ_WRITE_TOKEN (또는 *_READ_WRITE_TOKEN)
+ * (2) OIDC 방식: Vercel이 BLOB_STORE_ID 만 주고, 인증은 @vercel/blob 이 알아서 한다. (새 스토어의 기본값)
+ */
+export function hasBlobAuth(env = process.env) {
+  return Boolean(findBlobToken(env) || env.BLOB_STORE_ID);
+}
+
+/** put/del/list 에 넘길 인증 옵션. 열쇠가 있으면 { token }, OIDC 방식이면 {} (SDK가 환경 변수로 알아서 인증) */
+export function blobAuthOptions(env = process.env) {
+  const token = findBlobToken(env);
+  return token ? { token } : {};
+}
+
 export function monthlyOpsLimit(env = process.env) {
   const n = Number(env.UPLOAD_MONTHLY_OPS_LIMIT);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : UPLOAD_LIMITS.DEFAULT_MONTHLY_OPS_LIMIT;
@@ -131,8 +157,8 @@ export function registerUploadRoutes(deps, options = {}) {
 
   // 사진 올리기: 본문이 사진 파일 그대로다. (Content-Type: image/webp 등)
   router.post('/api/uploads', requireAuth, writeLimiter, readImageBody, wrap(async (req, res) => {
-    if (!process.env.BLOB_READ_WRITE_TOKEN) {
-      console.error('[uploads] BLOB_READ_WRITE_TOKEN 환경 변수가 없습니다. Vercel Storage에서 Blob을 연결하세요.');
+    if (!hasBlobAuth()) {
+      console.error('[uploads] Blob 연결 정보가 없습니다. (BLOB_READ_WRITE_TOKEN 도 BLOB_STORE_ID 도 없음) Vercel Storage에서 Blob을 이 프로젝트에 연결하고 재배포하세요.');
       throw new HttpError(503, '사진 저장소가 아직 준비되지 않았습니다.');
     }
     const isAdmin = isAdminId(req.user.id);
@@ -171,7 +197,7 @@ export function registerUploadRoutes(deps, options = {}) {
     let blobResult;
     try {
       const { put } = await getBlob();
-      blobResult = await put(pathname, buf, { access: 'public', contentType: mime, addRandomSuffix: false, cacheControlMaxAge: 60 * 60 * 24 * 30 });
+      blobResult = await put(pathname, buf, { access: 'public', contentType: mime, addRandomSuffix: false, cacheControlMaxAge: 60 * 60 * 24 * 30, ...blobAuthOptions() });
     } catch (err) {
       console.error('[uploads] Blob 저장 실패', err);
       await userRef.set({ uploadBytes: FieldValue.increment(-size), uploadCount: FieldValue.increment(-1), uploadMonthCount: FieldValue.increment(-1) }, { merge: true }).catch(() => {});
@@ -208,7 +234,7 @@ export function registerUploadRoutes(deps, options = {}) {
     const size = Number(snap.get('size')) || 0;
     try {
       const { del } = await getBlob();
-      await del(String(snap.get('url')));
+      await del(String(snap.get('url')), blobAuthOptions());
     } catch (err) {
       console.error('[uploads] Blob 삭제 실패', err);
       throw new HttpError(502, '사진 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요.');
@@ -254,7 +280,7 @@ export function registerUploadRoutes(deps, options = {}) {
     let count = 0;
     let cursor;
     for (let page = 0; page < 50; page += 1) { // 최대 5만 장까지만 (무한 반복 방지)
-      const result = await list({ prefix: `${BLOB_PREFIX}/`, limit: 1000, cursor });
+      const result = await list({ prefix: `${BLOB_PREFIX}/`, limit: 1000, cursor, ...blobAuthOptions() });
       for (const blob of result.blobs) { bytes += Number(blob.size) || 0; count += 1; }
       if (!result.hasMore) break;
       cursor = result.cursor;

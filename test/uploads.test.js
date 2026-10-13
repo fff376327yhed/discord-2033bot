@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
-import { registerUploadRoutes, sniffImage, checkQuota, monthKey, UPLOAD_LIMITS } from '../src/uploads.js';
+import { registerUploadRoutes, sniffImage, checkQuota, monthKey, findBlobToken, hasBlobAuth, blobAuthOptions, UPLOAD_LIMITS } from '../src/uploads.js';
 
 process.env.BLOB_READ_WRITE_TOKEN = 'test-token';
 process.env.ADMIN_DISCORD_IDS = '999999999999';
@@ -200,4 +200,18 @@ test('내 사진 보관함: 내 것만, 최근 순으로 나온다. 다시 계�
     assert.equal(stats.opsMonthCount, 2);
     assert.equal(stats.opsLimit, 2000);
   } finally { ctx.server.close(); }
+});
+
+test('Blob 열쇠 찾기: 기본 이름, 접두어가 바뀐 이름, 없을 때', () => {
+  assert.equal(findBlobToken({ BLOB_READ_WRITE_TOKEN: 'a', X_READ_WRITE_TOKEN: 'b' }), 'a');
+  assert.equal(findBlobToken({ STORE_READ_WRITE_TOKEN: 'b' }), 'b');
+  assert.equal(findBlobToken({ BLOB_STORE_ID: 'x', BLOB_WEBHOOK_PUBLIC_KEY: 'y' }), undefined);
+});
+
+test('Blob 인증: 열쇠 방식과 OIDC(BLOB_STORE_ID만 있는) 방식 둘 다 인정한다', () => {
+  assert.equal(hasBlobAuth({ BLOB_STORE_ID: 'store_abc', BLOB_WEBHOOK_PUBLIC_KEY: 'k' }), true); // 지금 이 프로젝트의 모양
+  assert.deepEqual(blobAuthOptions({ BLOB_STORE_ID: 'store_abc' }), {}); // SDK가 알아서 인증
+  assert.equal(hasBlobAuth({ BLOB_READ_WRITE_TOKEN: 't' }), true);
+  assert.deepEqual(blobAuthOptions({ BLOB_READ_WRITE_TOKEN: 't' }), { token: 't' });
+  assert.equal(hasBlobAuth({}), false);
 });
