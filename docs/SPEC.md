@@ -60,7 +60,7 @@ Config
 Scene
 ├── body: string (<=1800자)         // 본문
 ├── imageUrl?: string (<=500자, https만)
-├── station?: string (<=40자)       // 화면 표시용 "역 이름" 같은 배지
+├── station?: string (<=40자)       // 화면 상단에 뜨는 "장소/배지" 한 줄 (장소명, 챕터명 등 자유롭게 사용)
 ├── isEnding: boolean
 ├── endingName?: string (<=50자)    // isEnding=true일 때
 ├── endingType?: "good" | "bad" | "hidden"
@@ -72,13 +72,26 @@ Scene
 ```
 {
   label: string (<=80자),
-  to: string,                 // 이동할 scene 키 (존재해야 함)
+  to: string | WeightedBranch[],   // 이동할 scene 키. 아래 "분기 대상" 참고
+  fixedVisit?: { count: number, sceneId: string },  // 이 선택지를 count번째로 고르는 순간 무조건 sceneId로 (선택)
   condition?: Condition[],    // 최대 10개, 전부 만족해야 선택 가능
   effects?: Effect[],         // 최대 10개, 선택 시 적용
   hideWhenLocked?: boolean    // true면 조건 미충족 시 아예 숨김
                                // false(기본)면 🔒 잠금 상태로 보여줌
 }
+
+WeightedBranch: { sceneId: string, weight: number }   // weight 비율대로 추첨 (예: 70/30)
 ```
+
+### 분기 대상 (`to`) — 고정 / 랜덤 / N번째 고정
+
+`lib.js`의 `resolveChoiceTarget()`이 매 선택마다 아래 우선순위로 실제 이동할 scene을 정한다:
+
+1. **N번째 고정** — `fixedVisit`이 있고, 이 선택지를 고르는 게 정확히 `fixedVisit.count`번째라면 `fixedVisit.sceneId`로 확정 이동 (몇 번째인지는 `state.history`에서 같은 장면+같은 선택지 조합이 몇 번 나왔는지로 센다).
+2. **랜덤 분기** — `to`가 배열(`WeightedBranch[]`)이면, `weight` 비율대로 추첨해서 하나를 고른다. (예: `[{sceneId:"a",weight:70},{sceneId:"b",weight:30}]` → 70% 확률로 a)
+3. **고정(기본)** — `to`가 문자열이면 기존처럼 항상 그 장면으로 (지금까지 쓰던 방식 그대로 호환됨).
+
+`choice.to`가 배열인 경우, 유효성 검사 시 배열 안의 모든 `sceneId`와 `fixedVisit.sceneId`가 scenes에 실제로 존재해야 한다 (문자열 `to`와 동일한 규칙).
 
 ## 4. Condition / Effect 항목 (entry)
 
@@ -97,7 +110,8 @@ Scene
 
 - `startSceneId`는 `scenes`에 실제로 존재해야 함
 - 엔딩이 아닌 장면은 **선택지가 1개 이상** 있어야 함 (막다른 길 금지)
-- 모든 `choice.to`는 존재하는 scene 키여야 함 (끊긴 분기 금지)
+- 모든 `choice.to`는 존재하는 scene 키여야 함 (문자열이든, 배열 안의 각 `sceneId`든 — 끊긴 분기 금지)
+- `fixedVisit.sceneId`를 썼다면 그 scene도 존재해야 함
 - `stats`에 `onZero`를 넣었다면 그 대상 scene도 존재해야 함
 - 리다이렉트(onZero 연쇄)는 최대 5단계까지만 허용 (무한루프 방지)
 

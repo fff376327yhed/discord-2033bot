@@ -10,6 +10,7 @@
 //   6) Editor (default) — 위 조각들을 조립하는 본체
 import { useEffect, useMemo, useRef, useState, useCallback, memo } from 'react';
 import { api, describeCondition, labelOf, startStory, advance, getAvailableChoices } from './lib.js';
+import ImageUploader from './ImageUploader.jsx';
 
 /* ═════════════════════════ 1) ConfigPanel ═════════════════════════ */
 
@@ -605,10 +606,7 @@ function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, confi
             <label>장소 배지 (화면 상단에 뜸, 선택)</label>
             <input value={scene.station ?? ''} maxLength={LIMITS.STATION} onChange={(e) => onChange({ station: e.target.value || null })} />
           </div>
-          <div className="field">
-            <label>이미지 주소 (https만 가능, 선택)</label>
-            <input value={scene.imageUrl ?? ''} maxLength={LIMITS.IMAGE_URL} onChange={(e) => onChange({ imageUrl: e.target.value || null })} />
-          </div>
+          <ImageUploader value={scene.imageUrl} onChange={(url) => onChange({ imageUrl: url })} />
           <label className="check">
             <input type="checkbox" checked={Boolean(scene.isEnding)} onChange={(e) => onChange({ isEnding: e.target.checked })} />
             이 장면은 엔딩입니다

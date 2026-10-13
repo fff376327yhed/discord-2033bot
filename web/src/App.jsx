@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { api, avatarUrl } from './lib.js';
 import Editor from './Editor.jsx';
+import StorageMonitor from './StorageMonitor.jsx';
 
 /* ───────────────────────── Login ───────────────────────── */
 
@@ -272,6 +273,7 @@ function AdminPanel({ onOpen }) {
 
   return (
     <div className="story-list">
+      <StorageMonitor />
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         {Object.keys(STATUS_LABELS).map((s) => (
           <button

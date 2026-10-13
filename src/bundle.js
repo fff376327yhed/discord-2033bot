@@ -9,6 +9,7 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
+import { registerUploadRoutes } from './uploads.js';
 
 // ═════════════════════════════════════════════
 // lib/collections: 컬렉션 이름, 제한값, ID 규칙
@@ -3668,6 +3669,9 @@ export function createWebRouter({
       res.json({ users });
     })
   );
+
+  // 사진 업로드 (Vercel Blob). 일반 유저는 제한, 운영자는 무제한 + 사용량 보기
+  registerUploadRoutes({ router, requireAuth, requireAdmin, writeLimiter, getDb, isAdminId, HttpError, wrap, FieldValue });
 
   return router;
 }

@@ -1,0 +1,17 @@
+/* 사진 올리기 / 사용량 화면 전용 스타일 (기존 styles.css 의 변수를 그대로 쓴다) */
+.img-row { display: flex; gap: 8px; align-items: center; }
+.img-row > input:not([hidden]) { flex: 1; min-width: 0; }
+.img-row > button { flex: 0 0 auto; white-space: nowrap; }
+.img-preview { display: block; max-width: 100%; max-height: 180px; margin-top: 8px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel2); }
+.img-usage { margin-top: 8px; }
+.meter { height: 10px; background: var(--panel2); border-radius: 999px; overflow: hidden; }
+.meter-fill { height: 100%; background: var(--good); border-radius: 999px; transition: width .4s ease; }
+.meter-fill.warn { background: var(--warn); }
+.meter-fill.danger { background: var(--danger); }
+.monitor { margin-bottom: 16px; }
+.monitor-big { font-size: 28px; font-weight: 800; margin: 4px 0 8px; }
+.monitor-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); font-size: 14px; }
+.monitor-thumbs { display: flex; gap: 8px; flex-wrap: wrap; }
+.monitor-thumbs img { width: 64px; height: 64px; object-fit: cover; border-radius: 10px; border: 1px solid var(--border); display: block; }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); animation: livepulse 1.6s ease-in-out infinite; }
+@keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
