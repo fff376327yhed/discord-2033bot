@@ -1027,15 +1027,21 @@ function authorText(authorId) {
   return /^\d{5,25}$/.test(String(authorId)) ? `<@${authorId}>` : '운영자';
 }
 
-// 능력치 막대 설정: 칸 수, 위험 기준, 키별 아이콘
+// 능력치 막대 설정: 칸 수, 위험 기준
 const BAR_SLOTS = 5;
 const DANGER_RATIO = 0.2; // 20% 이하면 위험
 const EMPTY_ICON = '🖤';
-const BAR_ICONS = {
-  hp: { lead: '', on: '❤️' },
-  sanity: { lead: '🧠', on: '❤️' },
-};
+const FILLED_ICON = '🟩';
 const NUMBER_ICONS = { money: '🪙', coin: '🪙', gold: '🪙' };
+
+// ★ 본문 맨 위에 "기본으로" 보여줄 3가지 (체력 / 멘탈 / 돈). 나머지(정신력·탄약·식량 등)는 📊 상세에서만 보인다.
+//   keys   = 스토리 설정의 능력치 키 이름,  labels = 화면에 표시되는 이름 (둘 중 하나만 맞아도 표시)
+//   바꾸고 싶으면 여기 목록만 고치면 된다. (예: 정신력도 위에 띄우려면 mental 의 keys 에 'sanity' 추가)
+const TOP_STATUS = [
+  { keys: ['hp', 'health'], labels: ['체력'], icon: '❤️' },
+  { keys: ['mental', 'mind'], labels: ['멘탈'], icon: '🧠' },
+  { keys: ['money', 'coin', 'gold'], labels: ['돈', '골드', '코인'], icon: '🪙' },
+];
 
 // 능력치의 최소/최대 (설정에 없으면 엔진 기본 범위)
 function statRange(bucket, def) {
@@ -1043,60 +1049,87 @@ function statRange(bucket, def) {
   return [Number.isFinite(def?.min) ? def.min : defMin, Number.isFinite(def?.max) ? def.max : defMax];
 }
 
-// 본문 맨 위 한 줄: 스탯은 5칸 막대, 자원은 숫자(범위가 10 이하인 자원만 막대)
-function statusLine(config, state) {
-  const parts = [];
-  let danger = false;
-  for (const bucket of ['stats', 'resources']) {
-    for (const [key, def] of Object.entries(config?.[bucket] ?? {})) {
-      const value = Number(readOwn(state[bucket], key, 0)) || 0;
-      const [min, max] = statRange(bucket, def);
-      const label = truncate(def.label ?? key, 20);
-      const asBar = max > min && (bucket === 'stats' || max - min <= 10);
-      if (!asBar) {
-        parts.push(NUMBER_ICONS[key] ? `${NUMBER_ICONS[key]} ${value}` : `${label} ${value}`);
-        continue;
-      }
-      const ratio = (value - min) / (max - min);
-      const filled = value <= min ? 0 : Math.min(BAR_SLOTS, Math.max(1, Math.round(ratio * BAR_SLOTS)));
-      const low = ratio <= DANGER_RATIO;
-      if (low) danger = true;
-      const icon = BAR_ICONS[key] ?? { lead: '', on: '🟩' };
-      parts.push(`${icon.lead}${icon.on.repeat(filled)}${EMPTY_ICON.repeat(BAR_SLOTS - filled)} ${label}${low ? '⚠️' : ''}`);
-    }
-  }
-  return { line: parts.join('   '), danger };
+// 값 → 5칸 막대 (0이면 전부 빈칸, 0보다 크면 최소 1칸)
+function barText(value, min, max, onIcon) {
+  const ratio = max > min ? (value - min) / (max - min) : 0;
+  const filled = value <= min ? 0 : Math.min(BAR_SLOTS, Math.max(1, Math.round(ratio * BAR_SLOTS)));
+  return { text: onIcon.repeat(filled) + EMPTY_ICON.repeat(BAR_SLOTS - filled), ratio };
 }
 
-// 상세 보기용 필드: 전체 능력치(현재/최대), 자원, 소지품
+// 설정에서 TOP_STATUS 한 칸에 해당하는 능력치를 찾는다. (stats 먼저, 그다음 resources)
+function findTopEntry(config, spec) {
+  for (const bucket of ['stats', 'resources']) {
+    for (const [key, def] of Object.entries(config?.[bucket] ?? {})) {
+      if (spec.keys.includes(key) || spec.labels.includes(def?.label)) return { bucket, key, def };
+    }
+  }
+  return null;
+}
+
+// 본문 맨 위 요약: 체력 · 멘탈 · 돈 3줄만. (인용 블록 > 으로 본문과 시각적으로 분리)
+//   스탯은 막대 + 숫자, 돈 같은 자원은 아이콘 + 숫자
+function statusLine(config, state) {
+  const lines = [];
+  let danger = false;
+  for (const spec of TOP_STATUS) {
+    const found = findTopEntry(config, spec);
+    if (!found) continue;
+    const { bucket, key, def } = found;
+    const value = Number(readOwn(state[bucket], key, 0)) || 0;
+    const [min, max] = statRange(bucket, def);
+    const label = truncate(def.label ?? key, 20);
+    const asBar = max > min && (bucket === 'stats' || max - min <= 10);
+    if (!asBar) {
+      lines.push(`> ${NUMBER_ICONS[key] ?? spec.icon} **${label}**  ${value}`);
+      continue;
+    }
+    const { text, ratio } = barText(value, min, max, spec.icon);
+    const low = ratio <= DANGER_RATIO;
+    if (low) danger = true;
+    lines.push(`> ${text}  **${label}**  ${value}/${max}${low ? ' ⚠️' : ''}`);
+  }
+  return { line: lines.join('\n'), danger };
+}
+
+// 상세 보기용 필드: 전체 능력치(현재/최대), 자원, 소지품 — 한 줄에 하나씩
 // 파벌(호감도)은 일부러 안 보여준다 — 수치 자체가 스포일러(어느 쪽에 줄 서야 좋은 엔딩인지)가 되기 쉬움.
 // 조건/엔딩 분기에는 그대로 쓰이고, 화면에 숫자만 안 뜨는 것.
 function stateFields(config, state) {
   const fields = [];
-  const groups = [['stats', '상태'], ['resources', '자원']];
+  const groups = [['stats', '📈 상태'], ['resources', '🎒 자원']];
   for (const [bucket, title] of groups) {
-    const parts = Object.entries(config?.[bucket] ?? {}).map(([key, def]) => {
-      const value = readOwn(state[bucket], key, 0);
+    const rows = Object.entries(config?.[bucket] ?? {}).map(([key, def]) => {
+      const value = Number(readOwn(state[bucket], key, 0)) || 0;
       const [min, max] = statRange(bucket, def);
+      const label = truncate(def.label ?? key, 20);
       const showMax = bucket === 'stats' || (bucket === 'resources' && max - min <= 10);
-      const shown = showMax ? `${value}/${max}` : `${value}`;
-      return `**${truncate(def.label ?? key, 20)}** ${shown}`;
+      if (showMax && max > min) {
+        const { ratio } = barText(value, min, max, FILLED_ICON);
+        const low = ratio <= DANGER_RATIO;
+        return `${NUMBER_ICONS[key] ?? '▫️'} **${label}**  ${value}/${max}${low ? ' ⚠️' : ''}`;
+      }
+      return `${NUMBER_ICONS[key] ?? '▫️'} **${label}**  ${value}`;
     });
-    if (parts.length > 0) fields.push({ name: title, value: truncate(parts.join(' · '), 1024), inline: false });
+    if (rows.length > 0) fields.push({ name: title, value: truncate(rows.join('\n'), 1024), inline: false });
   }
   const items = Object.entries(state.inventory ?? {}).map(
-    ([key, count]) => `${truncate(config?.items?.[key]?.label ?? key, 20)} ×${count}`
+    ([key, count]) => `▫️ ${truncate(config?.items?.[key]?.label ?? key, 20)} ×${count}`
   );
-  fields.push({ name: '소지품', value: truncate(items.length ? items.join(', ') : '없음', 1024), inline: false });
+  fields.push({ name: '🧳 소지품', value: truncate(items.length ? items.join('\n') : '없음', 1024), inline: false });
   return fields;
 }
 
-/** 📊 상세 버튼을 눌렀을 때 나오는 창 (누른 사람에게만 보이게 privateReply로 보낸다) */
+/** 📊 상세 버튼을 눌렀을 때 나오는 창 (채널의 모두에게 보임 + 알림 없이 조용히: reply() 로 보낸다) */
 export function detailMessage({ story, state, config = {} }) {
   return {
     content: '',
     embeds: [
-      { title: truncate(`📊 ${story.title} — 상세`, 256), color: COLORS.normal, fields: stateFields(config, state) },
+      {
+        title: truncate(`📊 ${story.title} — 상세`, 256),
+        color: COLORS.normal,
+        fields: stateFields(config, state),
+        footer: { text: `- ${state.turn} -` },
+      },
     ],
     components: [],
   };
@@ -1124,7 +1157,7 @@ export function sceneMessage({ story, scene, state, config = {}, changes = [] })
 
   const embed = {
     title: truncate(ending ? `🏁 ${ENDING_LABEL[ending.type] ?? '엔딩'}: ${ending.name}` : story.title, 256),
-    description: truncate(line ? `${line}\n\n${body}` : body, 4000),
+    description: truncate(line ? `${line}\n\n${body}` : body, 4000), // 요약(인용 블록) → 빈 줄 → 본문
     color: ending ? (COLORS[ending.type] ?? COLORS.normal) : danger ? COLORS.bad : COLORS.normal,
     fields: [],
     footer: {
@@ -1749,7 +1782,7 @@ export async function abandonSession(userId, storyId) {
 //   c:<스토리ID>:<턴>:<번호>   선택지 선택
 //   r:<스토리ID>               이어하기
 //   x:<스토리ID>               포기
-//   d:<스토리ID>:<턴>          상세 보기 (나에게만 보임)
+//   d:<스토리ID>:<턴>          상세 보기 (모두에게 보임, 알림은 조용히)
 // ═════════════════════════════════════════════
 
 // 스토리 ID로 허용하는 글자 (Firestore 문서 ID와 custom_id에 안전한 문자만)
@@ -1948,7 +1981,7 @@ async function handleComponent(interaction) {
       // 읽기만 하는 버튼: 누른 사람 자신의 진행 상황을 나에게만 보이게 보여 준다
       const view = await getSessionView(user.id, storyId);
       if (!view) return errorReply('진행 중인 이야기를 찾을 수 없습니다. /스토리목록 으로 새로 시작하세요.');
-      return privateReply(detailMessage({ story: view.story, state: view.session.state, config: view.story.config }));
+      return reply(detailMessage({ story: view.story, state: view.session.state, config: view.story.config }));
     }
 
     default:
