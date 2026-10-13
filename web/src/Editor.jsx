@@ -144,11 +144,11 @@ function ConfigPanel({ meta, setMeta, config, setConfig, isPublic, onVisibility,
 
       <hr style={{ borderColor: 'var(--border)', margin: '16px 0' }} />
 
-      <BucketEditor title="스탯" bucket="stats" help={'플레이어의 몸과 마음 상태(체력, 정신력)예요. 0 아래로 떨어지면 정해 둔 장면(예: 사망 엔딩)으로 자동 이동시킬 수 있어요.'} config={config} setConfig={setConfig} numeric />
-      <BucketEditor title="자원" bucket="resources" help={'쓰고 모으는 소모품(식량, 필터, 탄약)이에요. 선택지 효과로 늘리거나 줄이고, 조건으로 ‘필터 1 이상일 때만’ 같은 제한을 걸 수 있어요.'} config={config} setConfig={setConfig} numeric />
-      <BucketEditor title="파벌" bucket="factions" help={'세력(한자 동맹, 레드라인 등)과의 호감도 수치예요. -100~100이고 시작은 보통 0이에요. 도와주면 올리고 배신하면 내려서, 호감도가 높을 때만 열리는 선택지나 엔딩을 만들 수 있어요.'} config={config} setConfig={setConfig} numeric />
-      <BucketEditor title="아이템" bucket="items" help={'개수를 세는 물건(방독면, 카드키)이에요. 효과로 얻거나 잃고, 조건으로 ‘방독면 1개 이상 필요’를 걸어요.'} config={config} setConfig={setConfig} />
-      <BucketEditor title="플래그" bucket="flags" help={'켜짐/꺼짐으로 기억하는 스위치예요. 숫자 없이 ‘그 일이 있었는지’만 저장해요(예: 시장 거래 완료, 비밀문 발견). 효과로 켜고 끄고, 조건으로 ‘켜져 있을 때만’ 또는 ‘꺼져 있을 때만’ 선택할 수 있게 해요. 한 번만 일어나야 하는 일에 쓰세요.'} config={config} setConfig={setConfig} />
+      <BucketEditor title="스탯" bucket="stats" help={'체력·정신력처럼 오르내리는 상태값이에요. 0이 되면 지정한 장면(죽음 엔딩 등)으로 자동 이동할 수 있어요.'} config={config} setConfig={setConfig} numeric />
+      <BucketEditor title="자원" bucket="resources" help={'식량·필터처럼 쓰고 모으는 수치예요. 선택지에서 늘리거나 줄이고, "N개 이상일 때만" 조건으로 쓸 수 있어요.'} config={config} setConfig={setConfig} numeric />
+      <BucketEditor title="호감도" bucket="factions" help={'세력과의 호감도예요. −100~100, 보통 0에서 시작해요. 특정 수치 이상일 때만 열리는 선택지·엔딩을 만들 수 있어요.'} config={config} setConfig={setConfig} numeric />
+      <BucketEditor title="소지품" bucket="items" help={'개수로 세는 물건이에요. 선택지로 얻거나 잃고, "N개 이상 필요" 조건을 걸 수 있어요.'} config={config} setConfig={setConfig} />
+      <BucketEditor title="이벤트" bucket="flags" help={'한 번 있었던 일을 켜짐/꺼짐으로만 기억하는 스위치예요. 숫자 없이 "그 일이 있었는지"만 체크할 때 써요.'} config={config} setConfig={setConfig} />
       <StartInventoryEditor config={config} setConfig={setConfig} />
 
       <hr style={{ borderColor: 'var(--border)', margin: '16px 0' }} />
@@ -401,7 +401,7 @@ function PlayPreview({ config, scenes, startSceneId, storyTitle, onClose }) {
 // 서버 쪽 값이 바뀌면 여기도 같이 맞춰야 한다 (화면 제한은 참고용일 뿐, 최종 검증은 항상 서버가 한다).
 const LIMITS = { BODY: 1800, LABEL: 80, CHOICES: 5, STATION: 40, ENDING_NAME: 50, IMAGE_URL: 500, ENTRIES: 10 };
 const ENTRY_TYPES = ['stat', 'resource', 'faction', 'item', 'flag'];
-const TYPE_LABEL = { stat: '스탯', resource: '자원', faction: '파벌', item: '아이템', flag: '플래그' };
+const TYPE_LABEL = { stat: '스탯', resource: '자원', faction: '호감도', item: '소지품', flag: '이벤트' };
 const COND_OPS = ['>=', '<=', '>', '<', '==', '!='];
 const ENDING_TYPES = [{ value: 'good', label: '굿' }, { value: 'bad', label: '배드' }, { value: 'hidden', label: '히든' }];
 
@@ -557,7 +557,7 @@ function ChoiceCard({ choice, index, scenes, order, pageOf, config, onChange, on
       {(choice.condition ?? []).length > 0 && (
         <label className="check">
           <input type="checkbox" checked={Boolean(choice.hideWhenLocked)} onChange={(e) => onChange({ ...choice, hideWhenLocked: e.target.checked })} />
-          조건을 못 채우면 선택지를 숨김 (끄면 🔒 잠금으로 보여 줌)
+          조건을 못 채우면 선택지를 숨김 (끄면 🔒 잠금으로 보여줌)
         </label>
       )}
     </section>
