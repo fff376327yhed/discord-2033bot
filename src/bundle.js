@@ -1157,7 +1157,8 @@ export function sceneMessage({ story, scene, state, config = {}, changes = [] })
   const ending = state.ending;
   const choices = getAvailableChoices(config, state, scene);
   const shown = choices.slice(0, MAX_BUTTONS);
-  const { line, danger } = statusLine(config, state);
+  // 엔딩 화면에는 엔딩 글만 보여 준다. (상태 줄·변화·잠김 칸 없음)
+  const { line, danger } = ending ? { line: '', danger: false } : statusLine(config, state);
 
   let body = truncate(scene.body || '(본문 없음)', 3000);
   // 버튼 글자는 80자까지라서, 긴 선택지가 있으면 전체 문장을 본문 아래에 적는다
@@ -1188,19 +1189,34 @@ export function sceneMessage({ story, scene, state, config = {}, changes = [] })
     .filter((change) => change.type !== 'flag' && change.type !== 'faction')
     .slice(0, 10)
     .map((change) => `${truncate(change.label, 30)} ${change.from} → ${change.to}`);
-  if (changeLines.length > 0) {
+  if (!ending && changeLines.length > 0) {
     embed.fields.push({ name: '변화', value: truncate(changeLines.join('\n'), 1024), inline: false });
   }
 
   // 잠긴 선택지의 사유 (짧게 한 줄씩)
   const locked = choices.filter((choice) => !choice.enabled);
-  if (locked.length > 0) {
+  if (!ending && locked.length > 0) {
     const lines = locked.map((choice) => `🔒 ${truncate(choice.label, 20)} — ${truncate(choice.lockedReason, 40)}`);
     embed.fields.push({ name: '잠김', value: truncate(lines.join('\n'), 1024), inline: false });
   }
 
   // 엔딩이면 버튼을 모두 제거
-  if (ending) return { content: '', embeds: [embed], components: [] };
+  // 엔딩이면 선택지 대신 [다시하기] [스토리 선택] 버튼만 붙인다. (y:<스토리ID> / l:<스토리ID>)
+  if (ending) {
+    return {
+      content: '',
+      embeds: [embed],
+      components: [
+        {
+          type: ComponentType.ACTION_ROW,
+          components: [
+            { type: ComponentType.BUTTON, style: ButtonStyle.SUCCESS, label: '🔁 다시하기', custom_id: `y:${story.id}` },
+            { type: ComponentType.BUTTON, style: ButtonStyle.SECONDARY, label: '📚 스토리 선택', custom_id: `l:${story.id}` },
+          ],
+        },
+      ],
+    };
+  }
 
   if (choices.length === 0) {
     embed.description += '\n\n⚠️ 이 장면에는 선택지가 없습니다. /포기 로 나갈 수 있습니다.';
@@ -1798,6 +1814,8 @@ export async function abandonSession(userId, storyId) {
 //   d:<스토리ID>:<턴>          상세 보기 (모두에게 보임, 알림은 조용히)
 //   f:<스토리ID>:<턴>          새로고침 (최신 장면으로 다시 그리기, 주인만)
 //   g:<스토리ID>:<턴>          상세 창 새로고침 (최신 상태로 다시 그리기)
+//   y:<스토리ID>               엔딩 후 다시하기 (새 메시지)
+//   l:<스토리ID>               엔딩 후 스토리 선택 (새 메시지)
 // ═════════════════════════════════════════════
 
 // 스토리 ID로 허용하는 글자 (Firestore 문서 ID와 custom_id에 안전한 문자만)
@@ -1991,6 +2009,14 @@ async function handleComponent(interaction) {
       }
       return errorReply(result.message ?? '선택을 처리하지 못했습니다.');
     }
+
+    case 'y':
+      // 엔딩 후 다시하기: 엔딩 글은 그대로 두고, 같은 스토리를 처음부터 새 메시지로 시작 (끝난 기록은 덮어씀)
+      return startFlow(user, storyId, reply);
+
+    case 'l':
+      // 엔딩 후 스토리 선택: 공개 스토리 목록을 새 메시지로
+      return reply(storyListMessage((await searchPublicStories({ limit: 5 })).stories));
 
     case 'f': {
       // 새로고침: 저장된 최신 진행 상황으로 이 메시지를 다시 그린다. (주인만 가능 — 남의 메시지는 건드리지 못함)
