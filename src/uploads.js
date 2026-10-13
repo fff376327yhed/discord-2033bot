@@ -23,6 +23,12 @@ export const UPLOAD_LIMITS = {
 const COL_UPLOADS = 'uploads';   // uploads/{UUID}  사진 한 장당 문서 하나
 const COL_USERS = 'users';       // users/{디스코드ID}.uploadBytes / uploadCount
 const COL_META = 'meta';         // meta/uploadStats  전체 합계
+// 안 쓰는 사진을 찾을 때 장면을 훑는 곳. 이름은 bundle.js 의 COL(STORIES / SCENES / DRAFT_SCENES)과 같아야 한다.
+const COL_STORIES = 'stories';
+const COL_SCENES = 'scenes';
+const COL_DRAFT_SCENES = 'draftScenes';
+const UNUSED_GRACE_MS = 10 * 60 * 1000;   // 방금(10분 안에) 올린 사진은 아직 장면에 안 붙였을 수 있어서 후보에서 뺀다
+const UNUSED_SCAN_MAX_SCENES = 3000;       // 한 번에 훑을 장면 수 상한 (Firestore 읽기 비용 보호)
 const STATS_ID = 'uploadStats';
 const BLOB_PREFIX = 'story-images';
 const UPLOAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -153,6 +159,40 @@ export function registerUploadRoutes(deps, options = {}) {
       .map((d) => ({ id: d.id, url: d.get('url'), size: Number(d.get('size')) || 0, createdAt: Number(d.get('createdAt')) || 0 }))
       .sort((a, b) => b.createdAt - a.createdAt);
     res.json({ items });
+  }));
+
+  // 안 쓰는 사진 찾기: 내 모든 스토리의 장면(게시본 + 초안)을 훑어서, 어디에도 안 쓰이는 사진만 돌려준다.
+  // 지우는 건 하지 않는다. (화면에서 고른 사진만 DELETE /api/uploads/:id 로 지운다)
+  router.get('/api/uploads/mine/unused', requireAuth, wrap(async (req, res) => {
+    const db = getDb();
+    const userId = req.user.id;
+    const [uploadsSnap, storiesSnap] = await Promise.all([
+      db.collection(COL_UPLOADS).where('userId', '==', userId).limit(100).get(),
+      db.collection(COL_STORIES).where('authorId', '==', userId).get(),
+    ]);
+    // 읽기 전에 스토리 문서에 적힌 장면 수로 대략의 양을 가늠해서, 너무 많으면 거절한다.
+    const estimate = storiesSnap.docs.reduce((sum, d) => sum + (Number(d.get('sceneCount')) || 0) + (Number(d.get('draftSceneCount')) || 0), 0);
+    if (estimate > UNUSED_SCAN_MAX_SCENES) throw new HttpError(413, '스토리가 너무 많아서 한 번에 확인할 수 없어요. 안 쓰는 스토리를 정리한 뒤 다시 시도해 주세요.');
+
+    const used = new Set();
+    let scenesScanned = 0;
+    for (const story of storiesSnap.docs) {
+      for (const sub of [COL_SCENES, COL_DRAFT_SCENES]) {
+        const snap = await story.ref.collection(sub).select('imageUrl').get();
+        scenesScanned += snap.size;
+        for (const doc of snap.docs) {
+          const url = doc.get('imageUrl');
+          if (typeof url === 'string' && url) used.add(url);
+        }
+      }
+    }
+    const cutoff = Date.now() - UNUSED_GRACE_MS;
+    const total = uploadsSnap.size;
+    const unused = uploadsSnap.docs
+      .map((d) => ({ id: d.id, url: d.get('url'), size: Number(d.get('size')) || 0, createdAt: Number(d.get('createdAt')) || 0 }))
+      .filter((item) => item.url && !used.has(item.url) && item.createdAt < cutoff)
+      .sort((a, b) => b.createdAt - a.createdAt);
+    res.json({ unused, total, scanned: { stories: storiesSnap.size, scenes: scenesScanned } });
   }));
 
   // 사진 올리기: 본문이 사진 파일 그대로다. (Content-Type: image/webp 등)

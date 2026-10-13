@@ -19,6 +19,7 @@ export const COL = {
   USERS: 'users',             // users/{디스코드 유저 ID}
   STORIES: 'stories',         // stories/{UUID}
   SCENES: 'scenes',           // stories/{UUID}/scenes/{장면 키}  (하위 컬렉션)
+  DRAFT_SCENES: 'draftScenes', // stories/{UUID}/draftScenes/{장면 키}  (공개 중인 스토리를 고칠 때 쓰는 초안. 게시하기 전에는 플레이어에게 안 보인다)
   SESSIONS: 'playSessions',   // playSessions/{유저ID}_{스토리ID}
   ENDINGS: 'endingsSeen',     // endingsSeen/{유저ID}_{스토리ID}
   LIKES: 'likes',             // likes/{유저ID}_{스토리ID}  (6단계: 문서 ID가 곧 중복 방지)
@@ -2496,6 +2497,28 @@ function withIds(scenes) {
 
 const storyRef = (id) => getDb().collection(COL.STORIES).doc(id);
 const scenesRef = (id) => storyRef(id).collection(COL.SCENES);
+const draftScenesRef = (id) => storyRef(id).collection(COL.DRAFT_SCENES);
+
+// 초안 표시를 지우는 필드들. (story 문서에 draft* 필드를 쓰고, 게시/버리기/직접 저장 때 같이 지운다)
+const clearDraftFields = () => ({
+  hasDraft: false,
+  draftUpdatedAt: FieldValue.delete(),
+  draftStartSceneId: FieldValue.delete(),
+  draftConfig: FieldValue.delete(),
+  draftMeta: FieldValue.delete(),
+  draftSceneCount: FieldValue.delete(),
+});
+
+// 초안 장면 문서를 지운다. 한 번에 500건 제한이 있어서 400개씩 끊는다.
+// 실패해도 story.hasDraft 가 이미 꺼져 있어서 화면에는 영향이 없고, 다음 초안 저장이나 스토리 삭제 때 같이 정리된다.
+async function deleteDraftDocs(db, storyId) {
+  const snap = await draftScenesRef(storyId).get();
+  for (let i = 0; i < snap.docs.length; i += 400) {
+    const batch = db.batch();
+    snap.docs.slice(i, i + 400).forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+  }
+}
 const plainReader = { get: (ref) => ref.get() }; // 트랜잭션 없이 읽을 때 (tx.get 과 같은 모양)
 
 // 목록/요약에 내려줄 필드만 뽑는다 (config, scenes 제외)
@@ -3239,7 +3262,18 @@ export function createWebRouter({
       if (!isAuthor) return res.json({ story: summarize(id, data) }); // 스포일러/설정 노출 방지
 
       const scenes = scenesFromSnap(await scenesRef(id).get());
-      res.json({ story: { ...summarize(id, data), config: data.config ?? {} }, scenes });
+      const payload = { story: { ...summarize(id, data), config: data.config ?? {} }, scenes };
+      if (data.hasDraft === true) {
+        // 게시하지 않은 초안이 있으면 같이 보낸다. (에디터는 초안을 먼저 보여 준다)
+        payload.draft = {
+          updatedAt: data.draftUpdatedAt ?? 0,
+          startSceneId: data.draftStartSceneId ?? data.startSceneId ?? null,
+          config: data.draftConfig ?? data.config ?? {},
+          meta: data.draftMeta ?? null,
+          scenes: scenesFromSnap(await draftScenesRef(id).get()),
+        };
+      }
+      res.json(payload);
     })
   );
 
@@ -3330,10 +3364,125 @@ export function createWebRouter({
           startSceneId: next.startSceneId,
           ...(config ? { config } : {}),
           updatedAt: now,
+          ...(story.hasDraft === true ? clearDraftFields() : {}), // 이 저장이 최신본이므로 남은 초안은 버린다
         });
+        return { updatedAt: now, sceneCount: Object.keys(scenes).length, validation: report, hadDraft: story.hasDraft === true };
+      });
+      if (result.hadDraft) await deleteDraftDocs(getDb(), id).catch((err) => console.error('[초안 정리 실패]', err));
+      delete result.hadDraft;
+      res.json({ ok: true, ...result });
+    })
+  );
+
+  // ───────────── 공개 중 수정용 초안 (draft) ─────────────
+  // 공개 중인 스토리를 고칠 때는 초안에 저장하고, [게시]를 눌러야 플레이어에게 반영된다.
+  // 초안은 오류가 있어도 저장할 수 있다. (게시할 때만 validateStory 오류가 0개여야 한다)
+  // baseUpdatedAt      : 에디터가 불러온 "게시본" 시각. 다른 곳에서 게시본이 바뀌었으면 409.
+  // baseDraftUpdatedAt : 에디터가 마지막으로 아는 "초안" 시각. 다른 탭에서 초안이 바뀌었으면 409.
+  router.put(
+    '/api/stories/:id/draft',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const body = isPlainObject(req.body) ? req.body : {};
+      const errors = [];
+      const scenes = sanitizeScenes(body.scenes, errors);
+      const config = sanitizeConfig(body.config, errors);
+      const meta = sanitizeMeta(body, errors); // title / description / tags
+      let startSceneId = '';
+      if (typeof body.startSceneId === 'string' && SCENE_ID_PATTERN.test(body.startSceneId)) startSceneId = body.startSceneId;
+      else errors.push('startSceneId: 올바른 장면 키여야 합니다.');
+      failIfInvalid(errors);
+
+      const draftUpdatedAt = await getDb().runTransaction(async (tx) => {
+        const { ref, story } = await readOwned(tx, id, req.user.id);
+        checkBaseVersion(body.baseUpdatedAt, story);
+        if (body.baseDraftUpdatedAt !== undefined && body.baseDraftUpdatedAt !== (story.draftUpdatedAt ?? 0)) {
+          throw new HttpError(409, '다른 곳에서 먼저 수정되었습니다. 새로고침한 뒤 다시 저장하세요.', { currentUpdatedAt: story.draftUpdatedAt ?? 0 });
+        }
+        const oldSnap = await tx.get(draftScenesRef(id));
+        for (const [key, scene] of Object.entries(scenes)) tx.set(draftScenesRef(id).doc(key), scene);
+        for (const doc of oldSnap.docs) {
+          if (!Object.hasOwn(scenes, doc.id)) tx.delete(doc.ref);
+        }
+        const now = Date.now();
+        tx.update(ref, {
+          hasDraft: true,
+          draftUpdatedAt: now,
+          draftStartSceneId: startSceneId,
+          draftConfig: config,
+          draftMeta: meta,
+          draftSceneCount: Object.keys(scenes).length,
+        });
+        return now;
+      });
+      res.json({ ok: true, draftUpdatedAt });
+    })
+  );
+
+  // 초안 게시: 오류가 없으면 초안을 게시본으로 바꾸고 초안을 비운다.
+  router.post(
+    '/api/stories/:id/draft/publish',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const body = isPlainObject(req.body) ? req.body : {};
+      const db = getDb();
+
+      const result = await db.runTransaction(async (tx) => {
+        const { ref, story, sceneRefs } = await readOwned(tx, id, req.user.id, { withScenes: 'always' });
+        if (story.hasDraft !== true) throw new HttpError(404, '게시할 초안이 없습니다.');
+        if (body.baseDraftUpdatedAt !== undefined && body.baseDraftUpdatedAt !== (story.draftUpdatedAt ?? 0)) {
+          throw new HttpError(409, '다른 곳에서 초안이 먼저 수정되었습니다. 새로고침한 뒤 다시 게시하세요.', { currentUpdatedAt: story.draftUpdatedAt ?? 0 });
+        }
+        const draftSnap = await tx.get(draftScenesRef(id));
+        const scenes = {};
+        for (const doc of draftSnap.docs) scenes[doc.id] = doc.data();
+        const meta = isPlainObject(story.draftMeta) ? story.draftMeta : {};
+        const config = story.draftConfig ?? story.config;
+        const startSceneId = story.draftStartSceneId ?? story.startSceneId;
+
+        const report = validateStory({ ...story, ...meta, config, startSceneId, scenes: withIds(scenes) });
+        if (story.isPublic && !report.ok) {
+          throw new HttpError(422, '오류를 모두 고친 뒤에 게시할 수 있습니다.', { validation: report });
+        }
+
+        // 게시본을 초안으로 통째로 바꾼다. (게시본 쓰기 최대 200 + 지우기 최대 200 + 1 = 401건)
+        for (const [key, scene] of Object.entries(scenes)) tx.set(scenesRef(id).doc(key), scene);
+        for (const oldRef of sceneRefs) {
+          if (!Object.hasOwn(scenes, oldRef.id)) tx.delete(oldRef);
+        }
+        const now = Date.now();
+        const update = { config, startSceneId, sceneCount: Object.keys(scenes).length, updatedAt: now, ...meta, ...clearDraftFields() };
+        if (meta.title !== undefined || meta.tags !== undefined) {
+          Object.assign(update, searchKeys(meta.title ?? story.title, meta.tags ?? story.tags));
+        }
+        tx.update(ref, update);
         return { updatedAt: now, sceneCount: Object.keys(scenes).length, validation: report };
       });
+      // 초안 문서 정리는 트랜잭션 밖에서 (한 트랜잭션 500건 제한 때문). 실패해도 표시는 이미 꺼져 있다.
+      await deleteDraftDocs(db, id).catch((err) => console.error('[초안 정리 실패]', err));
+      clearPublicCache();
       res.json({ ok: true, ...result });
+    })
+  );
+
+  // 초안 버리기: 게시본은 그대로 두고 초안만 지운다.
+  router.delete(
+    '/api/stories/:id/draft',
+    requireAuth,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const id = requireStoryId(req);
+      const db = getDb();
+      await db.runTransaction(async (tx) => {
+        const { ref, story } = await readOwned(tx, id, req.user.id);
+        if (story.hasDraft === true) tx.update(ref, clearDraftFields());
+      });
+      await deleteDraftDocs(db, id).catch((err) => console.error('[초안 정리 실패]', err));
+      res.json({ ok: true });
     })
   );
 
@@ -3391,7 +3540,9 @@ export function createWebRouter({
 
       await db.runTransaction(async (tx) => {
         const { ref, story, sceneRefs } = await readOwned(tx, id, req.user.id, { withScenes: 'always' });
+        const draftSnap = await tx.get(draftScenesRef(id)); // 읽기는 쓰기보다 먼저 (트랜잭션 규칙)
         sceneRefs.forEach((sceneRef) => tx.delete(sceneRef));
+        draftSnap.docs.forEach((doc) => tx.delete(doc.ref)); // 장면 최대 200 + 초안 최대 200 + 스토리 1 + 쪽지 1 = 402건
         tx.delete(ref);
         tx.set(taskRef, { storyId: id, authorId: story.authorId, createdAt: Date.now() }); // 정리 쪽지
       });
