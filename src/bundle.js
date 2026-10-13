@@ -1209,6 +1209,7 @@ export function sceneMessage({ story, scene, state, config = {}, changes = [] })
     type: ComponentType.ACTION_ROW,
     components: [
       { type: ComponentType.BUTTON, style: ButtonStyle.SECONDARY, label: '📊 상세', custom_id: `d:${story.id}:${state.turn}` },
+      { type: ComponentType.BUTTON, style: ButtonStyle.SECONDARY, label: '🔄 새로고침', custom_id: `f:${story.id}:${state.turn}` },
     ],
   });
 
@@ -1783,6 +1784,7 @@ export async function abandonSession(userId, storyId) {
 //   r:<스토리ID>               이어하기
 //   x:<스토리ID>               포기
 //   d:<스토리ID>:<턴>          상세 보기 (모두에게 보임, 알림은 조용히)
+//   f:<스토리ID>:<턴>          새로고침 (최신 장면으로 다시 그리기, 주인만)
 // ═════════════════════════════════════════════
 
 // 스토리 ID로 허용하는 글자 (Firestore 문서 ID와 custom_id에 안전한 문자만)
@@ -1977,8 +1979,14 @@ async function handleComponent(interaction) {
       return errorReply(result.message ?? '선택을 처리하지 못했습니다.');
     }
 
+    case 'f': {
+      // 새로고침: 저장된 최신 진행 상황으로 이 메시지를 다시 그린다. (주인만 가능 — 남의 메시지는 건드리지 못함)
+      if (!isOwner) return errorReply(NOT_OWNER_MESSAGE);
+      return resumeFlow(user, storyId, update);
+    }
+
     case 'd': {
-      // 읽기만 하는 버튼: 누른 사람 자신의 진행 상황을 나에게만 보이게 보여 준다
+      // 읽기만 하는 버튼: 누른 사람 자신의 진행 상황을 채널에 조용히(알림 없이) 보여 준다
       const view = await getSessionView(user.id, storyId);
       if (!view) return errorReply('진행 중인 이야기를 찾을 수 없습니다. /스토리목록 으로 새로 시작하세요.');
       return reply(detailMessage({ story: view.story, state: view.session.state, config: view.story.config }));
