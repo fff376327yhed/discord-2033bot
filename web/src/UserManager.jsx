@@ -203,7 +203,7 @@ function UserDetail({ id, onClose, onShowStories, onChanged }) {
                 </a>{' '}
                 <span className="muted">({u.id})</span>{' '}
                 {u.isAdmin && <span className="badge">운영자</span>}{' '}
-                {u.blocked && <span className="badge um-bad">차단됨</span>}{' '}
+                {u.blocked && <span className="badge um-bad">차단됨{u.autoBlocked ? ' (자동)' : ''}</span>}{' '}
                 {u.suspiciousAt > 0 && <span className="badge um-warn" title={u.suspiciousReason}>🚩 의심</span>}
               </div>
               <div className="meta">
@@ -354,7 +354,7 @@ export default function UserManager({ onShowStories }) {
               <div className="um-name">
                 <strong>{u.username || '(이름 모름)'}</strong> <span className="muted">({u.id})</span>{' '}
                 {u.isAdmin && <span className="badge">운영자</span>}{' '}
-                {u.blocked && <span className="badge um-bad">차단됨</span>}{' '}
+                {u.blocked && <span className="badge um-bad">차단됨{u.autoBlocked ? ' (자동)' : ''}</span>}{' '}
                 {u.suspiciousAt > 0 && <span className="badge um-warn">🚩 의심</span>}
               </div>
               <div className="meta">
@@ -405,7 +405,8 @@ export function SecurityLog() {
     <div className="um-wrap">
       <div className="hint">
         로그인 확인값 불일치, 차단된 요청(403), 속도 제한(429), 로그인 없는 쓰기 시도, 운영자 주소에 접근한 일반 유저가 기록됩니다.
-        한 사람이 10분에 10번 걸리면 자동으로 🚩 의심 표시가 붙습니다. (차단은 운영자가 직접 판단)
+        의심 점수가 10분 안에 5점이 되면 🚩 의심 표시, 10점이 되면 자동 차단됩니다. (가짜 출처 요청·운영자 주소 접근 = 5점, 속도 제한 = 1점. 운영자는 차단되지 않음)
+        잘못 차단됐다면 "전체 유저"에서 해당 유저를 열어 차단 해제하세요.
       </div>
       <div><button type="button" className="btn btn-small" disabled={loading} onClick={() => load(null)}>새로고침</button></div>
 

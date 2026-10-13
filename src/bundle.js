@@ -2965,7 +2965,7 @@ export function createWebRouter({
   rateLimitBackend = createFirestoreRateLimitBackend(),
   cleanupRunner = (options) => runCleanup(getDb(), options),
   // 진짜 Firestore 저장소를 쓸 때만 기록한다. 테스트처럼 메모리 저장소를 넘기면 아무것도 기록하지 않는다. (테스트가 진짜 DB에 쓰는 사고 방지)
-  activity = sessionStore.usesFirestore ? createActivityLogger({ getDb, isAdminId, COL }) : createNoopActivityLogger(),
+  activity = sessionStore.usesFirestore ? createActivityLogger({ getDb, isAdminId, COL, sessionStore }) : createNoopActivityLogger(),
 } = {}) {
   const router = express.Router();
 

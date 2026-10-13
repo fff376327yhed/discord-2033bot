@@ -20,7 +20,6 @@
 
 import { createHmac, randomBytes } from 'node:crypto';
 import rateLimit from 'express-rate-limit';
-import { FieldPath } from 'firebase-admin/firestore';
 
 export const ACTIVITY = {
   SUB: 'activity',                 // users/{ID}/activity (하위 컬렉션)
@@ -33,7 +32,11 @@ export const ACTIVITY = {
   WRITE_TIMEOUT_MS: 1500,          // 로그를 쓰느라 응답을 늦추는 최대 시간
   SECURITY_THROTTLE_MS: 10_000,    // 같은 사람의 같은 보안 이벤트는 10초에 한 번만 기록 (도배 공격으로 쓰기 비용이 폭주하는 것 방지)
   DUP_THROTTLE_MS: 30_000,         // 같은 스토리 저장 로그는 30초에 한 번만
-  SUSPICIOUS_LIMIT: 10,            // 이 횟수만큼 수상한 요청을 하면 "의심" 표시
+  // 의심 점수: 10분 안에 점수가 쌓이면 표시/자동 차단한다.
+  //  - 우리 사이트가 아닌 곳에서 보낸 쓰기 요청(Origin/CSRF 403), 일반 유저의 운영자 주소 접근: 1건당 5점 (정상 사용에서는 거의 생기지 않음)
+  //  - 속도 제한(429): 1건당 1점
+  SUSPICIOUS_FLAG_SCORE: 5,        // 이 점수가 되면 🚩 의심 표시
+  SUSPICIOUS_BLOCK_SCORE: 10,      // 이 점수가 되면 자동 차단 (운영자는 제외, 환경 변수 AUTO_BLOCK=off 로 끌 수 있음)
   SUSPICIOUS_WINDOW_MS: 10 * 60_000,
   MAX_META_KEYS: 6,
   MAX_META_LEN: 100,
@@ -149,6 +152,7 @@ const LABEL_BY_TYPE = {
   'security.admin_probe': '운영자 주소에 일반 유저가 접근',
   'security.auth_state': '로그인 확인값 불일치 (가짜 로그인 의심)',
   'security.auto_flag': '자동 의심 표시',
+  'security.auto_block': '자동 차단 (해킹 시도 의심)',
 };
 
 // 같은 요청이 연달아 오면 한 번만 기록할 종류 (저장 버튼 한 번에 요청이 두 개 가는 경우 등)
@@ -162,7 +166,7 @@ const DUP_TYPES = new Set(['story.update', 'story.scenes', 'story.draft']);
  * @param {object} deps  getDb, isAdminId, COL(컬렉션 이름표) 를 bundle.js 에서 넘겨받는다.
  *                       (FieldValue 는 지금은 쓰지 않지만 받아 둔다)
  */
-export function createActivityLogger({ getDb, isAdminId = () => false, COL = { USERS: 'users' }, now = () => Date.now() } = {}) {
+export function createActivityLogger({ getDb, isAdminId = () => false, COL = { USERS: 'users' }, sessionStore = null, now = () => Date.now() } = {}) {
   const seenAt = new Map();    // userId → 마지막으로 "마지막 접속"을 쓴 시각
   const dupAt = new Map();     // 중복 방지 키 → 시각
   const secAt = new Map();     // 보안 이벤트 도배 방지 키 → 시각
@@ -212,7 +216,7 @@ export function createActivityLogger({ getDb, isAdminId = () => false, COL = { U
   }
 
   /** 수상한 일을 보안 로그에 기록한다. userId 는 모르면 null. */
-  async function logSecurity(type, meta = {}, req = null, { userId = null, status = 0 } = {}) {
+  async function logSecurity(type, meta = {}, req = null, { userId = null, status = 0, weight = 0 } = {}) {
     if (!enabled()) return false;
     try {
       const uid = userId && ID_PATTERN.test(String(userId)) ? String(userId) : null;
@@ -220,7 +224,7 @@ export function createActivityLogger({ getDb, isAdminId = () => false, COL = { U
       const who = req ? describe(req) : { ip: '', ipHash: '', device: '' };
 
       // 의심 표시용 횟수는 도배 방지(아래 throttle)보다 먼저 센다. 도배하는 사람일수록 빨리 걸려야 하니까.
-      if (uid) await noteSuspicious(uid, type, t);
+      if (uid && weight > 0) await noteSuspicious(uid, type, t, weight);
 
       const key = `${who.ipHash || '-'}:${type}:${uid ?? ''}`;
       if (t - (secAt.get(key) ?? 0) < ACTIVITY.SECURITY_THROTTLE_MS) return false;
@@ -243,26 +247,38 @@ export function createActivityLogger({ getDb, isAdminId = () => false, COL = { U
     }
   }
 
-  // 10분 안에 수상한 요청이 10번이면 유저 문서에 표시한다. (차단은 운영자가 직접 판단)
-  async function noteSuspicious(userId, type, t) {
-    const list = (flagWindow.get(userId) ?? []).filter((x) => t - x < ACTIVITY.SUSPICIOUS_WINDOW_MS);
-    list.push(t);
+  // 10분 안의 의심 점수를 더한다. 5점이면 🚩 표시, 10점이면 자동 차단.
+  // 운영자는 차단하지 않고 표시만 한다. (실수로 운영자가 잠기는 것 방지)
+  async function noteSuspicious(userId, type, t, weight) {
+    const list = (flagWindow.get(userId) ?? []).filter((x) => t - x.t < ACTIVITY.SUSPICIOUS_WINDOW_MS);
+    const before = list.reduce((sum, x) => sum + x.w, 0);
+    list.push({ t, w: weight });
     remember(flagWindow, userId, list);
-    if (list.length !== ACTIVITY.SUSPICIOUS_LIMIT) return;
-    await getDb().collection(COL.USERS).doc(userId).set(
-      { suspiciousAt: t, suspiciousReason: clean(`${LABEL_BY_TYPE[type] ?? type} 반복`, 60) },
-      { merge: true }
-    );
+    const after = before + weight;
+    const reason = clean(`${LABEL_BY_TYPE[type] ?? type}`, 60);
+
+    const crossedBlock = before < ACTIVITY.SUSPICIOUS_BLOCK_SCORE && after >= ACTIVITY.SUSPICIOUS_BLOCK_SCORE;
+    const crossedFlag = before < ACTIVITY.SUSPICIOUS_FLAG_SCORE && after >= ACTIVITY.SUSPICIOUS_FLAG_SCORE;
+    if (!crossedBlock && !crossedFlag) return;
+
+    const canBlock = crossedBlock && sessionStore && process.env.AUTO_BLOCK !== 'off' && !isAdminId(userId);
+    if (canBlock) {
+      // 차단하면 기존 로그인도 모두 끊긴다. (sessionStore.setBlocked 가 sessionsValidAfter 를 올린다)
+      await sessionStore.setBlocked(userId, true, { reason: `자동 차단: ${reason}`, now: t });
+      await getDb().collection(COL.USERS).doc(userId).set({ autoBlocked: true, suspiciousAt: t, suspiciousReason: reason }, { merge: true });
+    } else {
+      await getDb().collection(COL.USERS).doc(userId).set({ suspiciousAt: t, suspiciousReason: reason }, { merge: true });
+    }
     await getDb().collection(ACTIVITY.SECURITY_COL).doc(newLogId(t)).set({
       ts: t,
-      type: 'security.auto_flag',
-      label: LABEL_BY_TYPE['security.auto_flag'],
+      type: canBlock ? 'security.auto_block' : 'security.auto_flag',
+      label: LABEL_BY_TYPE[canBlock ? 'security.auto_block' : 'security.auto_flag'],
       userId,
       status: 0,
       ip: '',
       ipHash: '',
       device: '',
-      meta: cleanMeta({ trigger: type }),
+      meta: cleanMeta({ trigger: type, score: after }),
       expireAt: new Date(t + ACTIVITY.SECURITY_RETENTION_DAYS * 86_400_000),
     });
   }
@@ -292,15 +308,16 @@ export function createActivityLogger({ getDb, isAdminId = () => false, COL = { U
     const note = typeof res.locals?.auditNote === 'string' ? res.locals.auditNote : '';
     const jobs = [];
 
-    // 1) 보안 이벤트
+    // 1) 보안 이벤트 (weight = 의심 점수)
     if (status === 429) {
-      jobs.push(logSecurity('security.rate_limited', { path: shownPath }, req, { userId: user?.id, status }));
-    } else if (status === 403) {
-      jobs.push(logSecurity('security.forbidden', { path: shownPath, reason: note || 'forbidden' }, req, { userId: user?.id, status }));
+      jobs.push(logSecurity('security.rate_limited', { path: shownPath }, req, { userId: user?.id, status, weight: 1 }));
+    } else if (status === 403 && note) {
+      // note 가 있는 403 = 우리 코드가 "가짜 출처/헤더 없음"으로 막은 것. (업로드 용량 초과 같은 정상적인 403 은 기록하지 않는다)
+      jobs.push(logSecurity('security.forbidden', { path: shownPath, reason: note }, req, { userId: user?.id, status, weight: 5 }));
     } else if (status === 401 && method !== 'GET' && method !== 'HEAD') {
       jobs.push(logSecurity('security.unauthorized', { path: shownPath }, req, { status }));
     } else if (status === 404 && url.startsWith('/api/admin') && user && !isAdminId(user.id)) {
-      jobs.push(logSecurity('security.admin_probe', { path: clean(url, 80) }, req, { userId: user.id, status }));
+      jobs.push(logSecurity('security.admin_probe', { path: clean(url, 80) }, req, { userId: user.id, status, weight: 5 }));
     }
 
     // 2) 유저 활동 (로그인한 사람의 쓰기 요청이 성공했을 때만)
@@ -474,6 +491,7 @@ export function registerAdminUserRoutes({ router, requireAdmin, writeLimiter, ge
     lastLoginAt: Number(d.lastLoginAt) || 0,
     loginCount: Number(d.loginCount) || 0,
     blocked: d.blocked === true,
+    autoBlocked: d.blocked === true && d.autoBlocked === true,
     blockedAt: Number(d.blockedAt) || 0,
     blockedReason: String(d.blockedReason ?? ''),
     suspiciousAt: Number(d.suspiciousAt) || 0,
@@ -578,11 +596,11 @@ export function registerAdminUserRoutes({ router, requireAdmin, writeLimiter, ge
     wrap(async (req, res) => {
       const id = requireUserId(req);
       const limit = clampInt(req.query.limit, 1, 100, ACTIVITY.PAGE);
-      let query = getDb().collection(COL.USERS).doc(id).collection(ACTIVITY.SUB).orderBy(FieldPath.documentId(), 'desc');
-      if (typeof req.query.cursor === 'string' && /^\d{13}_[0-9a-f]{6}$/.test(req.query.cursor)) query = query.startAfter(req.query.cursor);
+      let query = getDb().collection(COL.USERS).doc(id).collection(ACTIVITY.SUB).orderBy('ts', 'desc');
+      if (/^\d{10,15}$/.test(String(req.query.cursor ?? ''))) query = query.startAfter(Number(req.query.cursor));
       const snap = await query.limit(limit + 1).get();
       const page = snap.docs.slice(0, limit);
-      res.json({ items: page.map(pickLog), nextCursor: snap.docs.length > limit ? page[page.length - 1].id : null });
+      res.json({ items: page.map(pickLog), nextCursor: snap.docs.length > limit ? String(page[page.length - 1].get('ts')) : null });
     })
   );
 
@@ -594,8 +612,9 @@ export function registerAdminUserRoutes({ router, requireAdmin, writeLimiter, ge
     wrap(async (req, res) => {
       const db = getDb();
       const limit = clampInt(req.query.limit, 1, 100, ACTIVITY.PAGE);
-      let query = db.collection(ACTIVITY.SECURITY_COL).orderBy(FieldPath.documentId(), 'desc');
-      if (typeof req.query.cursor === 'string' && /^\d{13}_[0-9a-f]{6}$/.test(req.query.cursor)) query = query.startAfter(req.query.cursor);
+      console.log('[admin] 보안 로그 조회'); // 오류가 나면 바로 아래에서 원인이 함께 찍힌다
+      let query = db.collection(ACTIVITY.SECURITY_COL).orderBy('ts', 'desc');
+      if (/^\d{10,15}$/.test(String(req.query.cursor ?? ''))) query = query.startAfter(Number(req.query.cursor));
       const snap = await query.limit(limit + 1).get();
       const page = snap.docs.slice(0, limit);
       const items = page.map(pickLog);
@@ -609,7 +628,7 @@ export function registerAdminUserRoutes({ router, requireAdmin, writeLimiter, ge
       }
       res.json({
         items: items.map((i) => ({ ...i, user: i.userId ? profiles[i.userId] ?? { id: i.userId, username: null, avatar: null } : null })),
-        nextCursor: snap.docs.length > limit ? page[page.length - 1].id : null,
+        nextCursor: snap.docs.length > limit ? String(page[page.length - 1].get('ts')) : null,
       });
     })
   );
