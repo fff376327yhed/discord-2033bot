@@ -7,6 +7,37 @@ export const config = { api: { bodyParser: false } };
 
 const MAX_BODY_BYTES = 100_000; // 이보다 큰 요청은 거절
 
+// 허용 채널 ID 목록 (환경 변수 ALLOWED_CHANNEL_IDS, 쉼표로 구분). 비어 있으면 모든 채널에서 허용한다.
+// 환경 변수 없이 코드에 직접 박고 싶으면 아래처럼 바꾸면 된다: const ALLOWED_CHANNEL_IDS = ['채널ID'];
+const ALLOWED_CHANNEL_IDS = (process.env.ALLOWED_CHANNEL_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// 허용된 채널인지 확인. 스레드에서 실행한 경우 부모 채널이 허용되어 있으면 통과시킨다.
+function isAllowedChannel(interaction) {
+  // 원인 확인용 로그: 문제가 해결되면 이 줄은 지워도 된다.
+  console.log('[채널검사]', {
+    list: ALLOWED_CHANNEL_IDS,
+    channel: interaction.channel_id,
+    parent: interaction.channel?.parent_id,
+  });
+  if (ALLOWED_CHANNEL_IDS.length === 0) return true;
+  const ids = [interaction.channel_id, interaction.channel?.id, interaction.channel?.parent_id];
+  return ids.some((id) => id && ALLOWED_CHANNEL_IDS.includes(id));
+}
+
+// 허용되지 않은 채널에서 쓴 사람에게만 보이는 안내 메시지
+function blockedReply(interaction) {
+  // 자동완성(type 4)에는 메시지로 답할 수 없어서 빈 목록으로 답한다.
+  if (interaction.type === 4) return { type: 8, data: { choices: [] } };
+  const mention = ALLOWED_CHANNEL_IDS.map((id) => `<#${id}>`).join(', ');
+  return {
+    type: 4,
+    data: { content: `이 봇은 ${mention} 채널에서만 사용할 수 있어요!`, flags: 64 },
+  };
+}
+
 // 원본 본문을 문자열로 읽는다.
 async function readRawBody(req) {
   if (typeof req.body === 'string') return req.body;
@@ -59,6 +90,9 @@ export default async function handler(req, res) {
 
   // 2) 디스코드의 연결 확인(PING)에는 PONG으로 답한다. 엔드포인트 URL 저장 때 필요
   if (interaction.type === InteractionType.PING) return send(res, 200, { type: 1 });
+
+  // 2-1) 허용되지 않은 채널이면 여기서 막는다. (버튼/자동완성/모달 포함 모든 상호작용)
+  if (!isAllowedChannel(interaction)) return send(res, 200, blockedReply(interaction));
 
   // 3) 실제 처리. 3초 안에 응답해야 한다.
   try {
