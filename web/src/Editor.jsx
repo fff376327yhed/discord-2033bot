@@ -144,11 +144,11 @@ function ConfigPanel({ meta, setMeta, config, setConfig, isPublic, onVisibility,
 
       <hr style={{ borderColor: 'var(--border)', margin: '16px 0' }} />
 
-      <BucketEditor title="스탯" bucket="stats" help={'체력·정신력처럼 오르내리는 상태값이에요. 0이 되면 지정한 장면(죽음 엔딩 등)으로 자동 이동할 수 있어요.'} config={config} setConfig={setConfig} numeric />
-      <BucketEditor title="자원" bucket="resources" help={'식량·필터처럼 쓰고 모으는 수치예요. 선택지에서 늘리거나 줄이고, "N개 이상일 때만" 조건으로 쓸 수 있어요.'} config={config} setConfig={setConfig} numeric />
-      <BucketEditor title="호감도" bucket="factions" help={'세력과의 호감도예요. −100~100, 보통 0에서 시작해요. 특정 수치 이상일 때만 열리는 선택지·엔딩을 만들 수 있어요.'} config={config} setConfig={setConfig} numeric />
-      <BucketEditor title="소지품" bucket="items" help={'개수로 세는 물건이에요. 선택지로 얻거나 잃고, "N개 이상 필요" 조건을 걸 수 있어요.'} config={config} setConfig={setConfig} />
-      <BucketEditor title="이벤트" bucket="flags" help={'한 번 있었던 일을 켜짐/꺼짐으로만 기억하는 스위치예요. 숫자 없이 "그 일이 있었는지"만 체크할 때 써요.'} config={config} setConfig={setConfig} />
+      <BucketEditor title="스탯" bucket="stats" help={'플레이어의 몸과 마음 상태(체력, 정신력)예요. 0 아래로 떨어지면 정해 둔 장면(예: 사망 엔딩)으로 자동 이동시킬 수 있어요.'} config={config} setConfig={setConfig} numeric />
+      <BucketEditor title="자원" bucket="resources" help={'쓰고 모으는 소모품(식량, 필터, 탄약)이에요. 선택지 효과로 늘리거나 줄이고, 조건으로 ‘필터 1 이상일 때만’ 같은 제한을 걸 수 있어요.'} config={config} setConfig={setConfig} numeric />
+      <BucketEditor title="파벌" bucket="factions" help={'세력(한자 동맹, 레드라인 등)과의 호감도 수치예요. -100~100이고 시작은 보통 0이에요. 도와주면 올리고 배신하면 내려서, 호감도가 높을 때만 열리는 선택지나 엔딩을 만들 수 있어요.'} config={config} setConfig={setConfig} numeric />
+      <BucketEditor title="아이템" bucket="items" help={'개수를 세는 물건(방독면, 카드키)이에요. 효과로 얻거나 잃고, 조건으로 ‘방독면 1개 이상 필요’를 걸어요.'} config={config} setConfig={setConfig} />
+      <BucketEditor title="플래그" bucket="flags" help={'켜짐/꺼짐으로 기억하는 스위치예요. 숫자 없이 ‘그 일이 있었는지’만 저장해요(예: 시장 거래 완료, 비밀문 발견). 효과로 켜고 끄고, 조건으로 ‘켜져 있을 때만’ 또는 ‘꺼져 있을 때만’ 선택할 수 있게 해요. 한 번만 일어나야 하는 일에 쓰세요.'} config={config} setConfig={setConfig} />
       <StartInventoryEditor config={config} setConfig={setConfig} />
 
       <hr style={{ borderColor: 'var(--border)', margin: '16px 0' }} />
@@ -357,7 +357,9 @@ function PlayPreview({ config, scenes, startSceneId, storyTitle, onClose }) {
 
   const choices = getAvailableChoices(config, state, scene);
   const statusParts = [];
-  for (const bucket of ['stats', 'resources', 'factions']) {
+  // 파벌(호감도)은 플레이어 화면에 수치로 노출하지 않는 게 기본 — 테스트 미리보기에서도 동일하게 숨김.
+  // 내부 조건(condition)/엔딩 분기 로직에는 그대로 쓰이고, 숫자만 화면에 안 보일 뿐이다.
+  for (const bucket of ['stats', 'resources']) {
     for (const [key, def] of Object.entries(config[bucket] ?? {})) {
       statusParts.push(`${def.label ?? key} ${state[bucket][key] ?? 0}`);
     }
@@ -401,7 +403,7 @@ function PlayPreview({ config, scenes, startSceneId, storyTitle, onClose }) {
 // 서버 쪽 값이 바뀌면 여기도 같이 맞춰야 한다 (화면 제한은 참고용일 뿐, 최종 검증은 항상 서버가 한다).
 const LIMITS = { BODY: 1800, LABEL: 80, CHOICES: 5, STATION: 40, ENDING_NAME: 50, IMAGE_URL: 500, ENTRIES: 10 };
 const ENTRY_TYPES = ['stat', 'resource', 'faction', 'item', 'flag'];
-const TYPE_LABEL = { stat: '스탯', resource: '자원', faction: '호감도', item: '소지품', flag: '이벤트' };
+const TYPE_LABEL = { stat: '스탯', resource: '자원', faction: '파벌', item: '아이템', flag: '플래그' };
 const COND_OPS = ['>=', '<=', '>', '<', '==', '!='];
 const ENDING_TYPES = [{ value: 'good', label: '굿' }, { value: 'bad', label: '배드' }, { value: 'hidden', label: '히든' }];
 
@@ -557,7 +559,7 @@ function ChoiceCard({ choice, index, scenes, order, pageOf, config, onChange, on
       {(choice.condition ?? []).length > 0 && (
         <label className="check">
           <input type="checkbox" checked={Boolean(choice.hideWhenLocked)} onChange={(e) => onChange({ ...choice, hideWhenLocked: e.target.checked })} />
-          조건을 못 채우면 선택지를 숨김 (끄면 🔒 잠금으로 보여줌)
+          조건을 못 채우면 선택지를 숨김 (끄면 🔒 잠금으로 보여 줌)
         </label>
       )}
     </section>
@@ -597,10 +599,10 @@ function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, confi
       <div className="body-count">{(scene.body ?? '').length} / {LIMITS.BODY}</div>
 
       <details className="scene-opts">
-        <summary>장면 설정 <span className="muted">역 이름 · 이미지 · 엔딩</span></summary>
+        <summary>장면 설정 <span className="muted">장소 · 이미지 · 엔딩</span></summary>
         <div className="scene-opts-body">
           <div className="field">
-            <label>역 이름 (표시용, 선택)</label>
+            <label>장소 배지 (화면 상단에 뜸, 선택)</label>
             <input value={scene.station ?? ''} maxLength={LIMITS.STATION} onChange={(e) => onChange({ station: e.target.value || null })} />
           </div>
           <div className="field">
@@ -712,7 +714,6 @@ export default function Editor({ storyId, onBack }) {
   const [search, setSearch] = useState('');
   const [sideOpen, setSideOpen] = useState(() => window.matchMedia(DESKTOP_QUERY).matches);
   const contentRef = useRef(null);
-  const importRef = useRef(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -846,39 +847,6 @@ export default function Editor({ storyId, onBack }) {
     }
   }
 
-  // JSON 파일(title/description/tags/config/scenes/startSceneId)을 읽어
-  // 현재 편집 중인 state를 통째로 덮어쓴다. 저장 버튼을 눌러야 서버에 실제 반영됨.
-  function handleImportFile(e) {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
-    if (!confirm(`'${file.name}' 내용으로 현재 편집 중인 스토리를 덮어쓸까요? (저장 전까지는 되돌릴 수 있습니다)`)) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const data = JSON.parse(reader.result);
-        if (!data.config || !data.scenes || !data.startSceneId) {
-          alert('config / scenes / startSceneId가 모두 있어야 합니다.');
-          return;
-        }
-        setMeta({
-          title: data.title ?? '',
-          description: data.description ?? '',
-          tags: Array.isArray(data.tags) ? data.tags : [],
-        });
-        setConfig(data.config);
-        setScenes(data.scenes);
-        setStartSceneId(data.startSceneId);
-        setSelected(data.startSceneId in data.scenes ? data.startSceneId : Object.keys(data.scenes)[0] ?? null);
-        setValidation(null);
-        setSaveMsg('불러왔습니다. 확인 후 저장을 눌러주세요.');
-      } catch (err) {
-        alert(`JSON을 읽지 못했습니다: ${err.message}`);
-      }
-    };
-    reader.readAsText(file, 'utf-8');
-  }
-
   if (loading) return <div style={{ padding: 20 }}>불러오는 중...</div>;
   if (error) return <div style={{ padding: 20 }}>⚠️ {error}</div>;
 
@@ -935,8 +903,6 @@ export default function Editor({ storyId, onBack }) {
           </button>
           <div className="spacer" />
           {saveMsg && <span className="ed-msg" role="status">{saveMsg}</span>}
-          <button type="button" className="btn" onClick={() => importRef.current?.click()}>📂 불러오기</button>
-          <input type="file" accept=".json,application/json" ref={importRef} onChange={handleImportFile} style={{ display: 'none' }} />
           <button type="button" className="btn" onClick={() => setPreview(true)}>▶ 미리보기</button>
           <button type="button" className="btn btn-primary" disabled={saving} onClick={handleSave}>{saving ? '저장 중...' : '저장'}</button>
         </div>

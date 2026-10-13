@@ -261,14 +261,51 @@ export async function startStory(config, startScene, loadScene) {
   return settle(config, createInitialState(config), startScene, loadScene);
 }
 
+// ── 분기 대상(choice.to) 해석 ──────────────────────────────────────────
+// choice.to 는 세 가지 형태를 지원한다:
+//   1) "scene_key"                                   → 기존 방식, 항상 그 장면 (고정)
+//   2) [{ sceneId, weight }, ...]                     → 가중치 랜덤 (weight 비율대로 추첨)
+//   3) 위 1)/2)에 choice.fixedVisit: { count, sceneId }를 같이 쓰면,
+//      "이 선택지를 N번째로 고르는 순간"에는 weight/고정값을 무시하고 sceneId로 확정 이동.
+//      (몇 번째인지는 state.history에서 같은 scene+choiceIndex 조합이 몇 번 나왔는지로 센다)
+function countChoicePicks(state, sceneId, choiceIndex) {
+  return state.history.filter((h) => h.from === sceneId && h.choice === choiceIndex).length;
+}
+
+function weightedPick(branches) {
+  const valid = (branches ?? []).filter(
+    (b) => b && typeof b.sceneId === 'string' && Number.isFinite(b.weight) && b.weight > 0
+  );
+  const total = valid.reduce((sum, b) => sum + b.weight, 0);
+  if (total <= 0) return null;
+  let r = Math.random() * total;
+  for (const b of valid) {
+    if (r < b.weight) return b.sceneId;
+    r -= b.weight;
+  }
+  return valid[valid.length - 1].sceneId;
+}
+
+export function resolveChoiceTarget(state, sceneId, choiceIndex, choice) {
+  const visitNumber = countChoicePicks(state, sceneId, choiceIndex) + 1; // 이번 선택이 몇 번째인지
+  const fv = choice.fixedVisit;
+  if (fv && Number.isInteger(fv.count) && typeof fv.sceneId === 'string' && visitNumber === fv.count) {
+    return fv.sceneId;
+  }
+  if (Array.isArray(choice.to)) return weightedPick(choice.to);
+  return choice.to; // 문자열 — 기존 방식, 그대로 동작
+}
+
 export async function advance(config, state, scene, choiceIndex, loadScene) {
   if (state.ending) return fail('ALREADY_ENDED', '이미 끝난 이야기입니다.');
   if (!scene || state.sceneId !== scene.id) return fail('SCENE_MISMATCH', '지금 장면의 선택지가 아닙니다.');
   const choice = Number.isInteger(choiceIndex) ? scene.choices?.[choiceIndex] : null;
   if (scene.isEnding || !choice) return fail('INVALID_CHOICE', '존재하지 않는 선택지입니다.');
   if (!checkConditions(state, choice.condition)) return fail('LOCKED', '조건을 만족하지 못해 선택할 수 없습니다.');
-  const target = await loadScene(choice.to);
-  if (!target) return fail('SCENE_NOT_FOUND', `장면 '${choice.to}'을(를) 찾을 수 없습니다.`);
+  const resolvedTo = resolveChoiceTarget(state, scene.id, choiceIndex, choice);
+  if (!resolvedTo) return fail('SCENE_NOT_FOUND', `선택지 '${choice.label}'의 이동 대상을 결정할 수 없습니다 (weight 설정을 확인하세요).`);
+  const target = await loadScene(resolvedTo);
+  if (!target) return fail('SCENE_NOT_FOUND', `장면 '${resolvedTo}'을(를) 찾을 수 없습니다.`);
   const applied = applyEffects(config, state, choice.effects);
   const moved = applied.state;
   moved.turn += 1;

@@ -394,6 +394,41 @@ export async function startStory(config, startScene, loadScene) {
   return settle(config, createInitialState(config), startScene, loadScene);
 }
 
+// ── 분기 대상(choice.to) 해석 ──────────────────────────────────────────
+// choice.to 는 세 가지 형태를 지원한다:
+//   1) "scene_key"                                   → 기존 방식, 항상 그 장면 (고정)
+//   2) [{ sceneId, weight }, ...]                     → 가중치 랜덤 (weight 비율대로 추첨)
+//   3) 위 1)/2)에 choice.fixedVisit: { count, sceneId }를 같이 쓰면,
+//      "이 선택지를 N번째로 고르는 순간"에는 weight/고정값을 무시하고 sceneId로 확정 이동.
+//      (몇 번째인지는 state.history에서 같은 scene+choiceIndex 조합이 몇 번 나왔는지로 센다)
+function countChoicePicks(state, sceneId, choiceIndex) {
+  return state.history.filter((h) => h.from === sceneId && h.choice === choiceIndex).length;
+}
+
+function weightedPick(branches) {
+  const valid = (branches ?? []).filter(
+    (b) => b && typeof b.sceneId === 'string' && Number.isFinite(b.weight) && b.weight > 0
+  );
+  const total = valid.reduce((sum, b) => sum + b.weight, 0);
+  if (total <= 0) return null;
+  let r = Math.random() * total;
+  for (const b of valid) {
+    if (r < b.weight) return b.sceneId;
+    r -= b.weight;
+  }
+  return valid[valid.length - 1].sceneId;
+}
+
+export function resolveChoiceTarget(state, sceneId, choiceIndex, choice) {
+  const visitNumber = countChoicePicks(state, sceneId, choiceIndex) + 1; // 이번 선택이 몇 번째인지
+  const fv = choice.fixedVisit;
+  if (fv && Number.isInteger(fv.count) && typeof fv.sceneId === 'string' && visitNumber === fv.count) {
+    return fv.sceneId;
+  }
+  if (Array.isArray(choice.to)) return weightedPick(choice.to);
+  return choice.to; // 문자열 — 기존 방식, 그대로 동작
+}
+
 /**
  * 선택지 1개를 골라 다음 장면으로 진행한다. 실패해도 넘겨받은 state는 바뀌지 않는다.
  * 실패 code: ALREADY_ENDED, SCENE_MISMATCH, INVALID_CHOICE, LOCKED, SCENE_NOT_FOUND, REDIRECT_LOOP
@@ -413,8 +448,10 @@ export async function advance(config, state, scene, choiceIndex, loadScene) {
     return fail('LOCKED', '조건을 만족하지 못해 선택할 수 없습니다.');
   }
 
-  const target = await loadScene(choice.to);
-  if (!target) return fail('SCENE_NOT_FOUND', `장면 '${choice.to}'을(를) 찾을 수 없습니다.`);
+  const resolvedTo = resolveChoiceTarget(state, scene.id, choiceIndex, choice);
+  if (!resolvedTo) return fail('SCENE_NOT_FOUND', `선택지 '${choice.label}'의 이동 대상을 결정할 수 없습니다 (weight 설정을 확인하세요).`);
+  const target = await loadScene(resolvedTo);
+  if (!target) return fail('SCENE_NOT_FOUND', `장면 '${resolvedTo}'을(를) 찾을 수 없습니다.`);
 
   // 1) 선택지의 효과 적용
   const applied = applyEffects(config, state, choice.effects);
@@ -513,8 +550,26 @@ export function validateStory(story) {
     choices.forEach((choice, i) => {
       const where = `'${id}'의 선택지 ${i + 1}`;
       if (!String(choice.label ?? '').trim()) errors.push(`${where}: 버튼 문구가 비어 있습니다.`);
-      if (has(choice.to)) edges[id].push(choice.to);
-      else errors.push(`${where}('${choice.label}'): 없는 장면 '${choice.to}'을(를) 가리킵니다 (끊긴 분기).`);
+
+      // 분기 대상(choice.to): 문자열(고정) 또는 [{sceneId, weight}, ...](랜덤) 둘 다 지원.
+      // 랜덤이면 어느 쪽으로 튀어도 끊기면 안 되므로 모든 sceneId를 edges에 등록한다.
+      const targets = Array.isArray(choice.to) ? choice.to.map((b) => b?.sceneId) : [choice.to];
+      if (targets.length === 0 || targets.every((t) => !t)) {
+        errors.push(`${where}('${choice.label}'): 이동 대상이 없습니다.`);
+      }
+      for (const target of targets) {
+        if (!target) continue;
+        if (has(target)) edges[id].push(target);
+        else errors.push(`${where}('${choice.label}'): 없는 장면 '${target}'을(를) 가리킵니다 (끊긴 분기).`);
+      }
+
+      // fixedVisit(N번째 고정)도 똑같이 검사하고 도달 가능 경로에 포함시킨다.
+      if (choice.fixedVisit) {
+        const fvTarget = choice.fixedVisit.sceneId;
+        if (has(fvTarget)) edges[id].push(fvTarget);
+        else errors.push(`${where}: fixedVisit 대상 '${fvTarget}'이(가) 없습니다.`);
+      }
+
       (choice.condition ?? []).forEach((cond) => checkRef(config, cond, `${where} 조건`, warnings));
       (choice.effects ?? []).forEach((effect) => checkRef(config, effect, `${where} 효과`, warnings));
     });
@@ -1010,10 +1065,12 @@ function statusLine(config, state) {
   return { line: parts.join('   '), danger };
 }
 
-// 상세 보기용 필드: 전체 능력치(현재/최대), 자원, 파벌, 소지품
+// 상세 보기용 필드: 전체 능력치(현재/최대), 자원, 소지품
+// 파벌(호감도)은 일부러 안 보여준다 — 수치 자체가 스포일러(어느 쪽에 줄 서야 좋은 엔딩인지)가 되기 쉬움.
+// 조건/엔딩 분기에는 그대로 쓰이고, 화면에 숫자만 안 뜨는 것.
 function stateFields(config, state) {
   const fields = [];
-  const groups = [['stats', '상태'], ['resources', '자원'], ['factions', '파벌']];
+  const groups = [['stats', '상태'], ['resources', '자원']];
   for (const [bucket, title] of groups) {
     const parts = Object.entries(config?.[bucket] ?? {}).map(([key, def]) => {
       const value = readOwn(state[bucket], key, 0);
@@ -1078,9 +1135,9 @@ export function sceneMessage({ story, scene, state, config = {}, changes = [] })
   const image = safeImageUrl(scene.imageUrl);
   if (image) embed.image = { url: image };
 
-  // 방금 일어난 변화 (플래그는 스포일러가 될 수 있어 숨긴다)
+  // 방금 일어난 변화 (플래그·파벌은 스포일러가 될 수 있어 숨긴다)
   const changeLines = changes
-    .filter((change) => change.type !== 'flag')
+    .filter((change) => change.type !== 'flag' && change.type !== 'faction')
     .slice(0, 10)
     .map((change) => `${truncate(change.label, 30)} ${change.from} → ${change.to}`);
   if (changeLines.length > 0) {
@@ -2301,20 +2358,60 @@ function sanitizeScene(scene, path, errors) {
     return clean;
   }
 
+  const MAX_RANDOM_BRANCHES = 5;
   clean.choices = cleanList(scene.choices, LIMITS.CHOICES_PER_SCENE, `${path}.choices`, errors, (choice, where) => {
     if (!isPlainObject(choice)) return void errors.push(`${where}: 객체여야 합니다.`);
-    // to는 작성 중에는 비어 있을 수 있다. (끊긴 분기는 공개 전 validateStory가 오류로 잡는다)
+
+    // to: 문자열(고정 한 곳, 기존 방식) 또는 [{sceneId, weight}, ...](가중치 랜덤 분기) 둘 다 허용.
+    // 작성 중에는 비어 있을 수 있다. (끊긴 분기는 공개 전 validateStory가 오류로 잡는다)
     let to = '';
-    if (choice.to !== undefined && choice.to !== null && choice.to !== '') {
+    if (Array.isArray(choice.to)) {
+      if (choice.to.length === 0) {
+        errors.push(`${where}.to: 분기가 1개 이상 필요합니다.`);
+      } else if (choice.to.length > MAX_RANDOM_BRANCHES) {
+        errors.push(`${where}.to: 랜덤 분기는 최대 ${MAX_RANDOM_BRANCHES}개까지입니다.`);
+      } else {
+        to = choice.to.map((branch, i) => {
+          const bWhere = `${where}.to[${i + 1}]`;
+          if (!isPlainObject(branch)) { errors.push(`${bWhere}: 객체여야 합니다.`); return null; }
+          let sceneId = '';
+          if (branch.sceneId !== undefined && branch.sceneId !== null && branch.sceneId !== '') {
+            if (typeof branch.sceneId === 'string' && SCENE_ID_PATTERN.test(branch.sceneId)) sceneId = branch.sceneId;
+            else errors.push(`${bWhere}.sceneId: 올바른 장면 키여야 합니다.`);
+          }
+          const weight = cleanNumber(branch.weight, 0.01, 1000, `${bWhere}.weight`, errors);
+          return { sceneId, weight: weight ?? 0 };
+        }).filter(Boolean);
+      }
+    } else if (choice.to !== undefined && choice.to !== null && choice.to !== '') {
       if (typeof choice.to === 'string' && SCENE_ID_PATTERN.test(choice.to)) to = choice.to;
       else errors.push(`${where}.to: 올바른 장면 키여야 합니다.`);
     }
+
+    // fixedVisit: 이 선택지를 count번째로 고르는 순간 무조건 sceneId로 이동 (선택 사항)
+    let fixedVisit;
+    if (choice.fixedVisit !== undefined && choice.fixedVisit !== null) {
+      if (!isPlainObject(choice.fixedVisit)) {
+        errors.push(`${where}.fixedVisit: 객체여야 합니다.`);
+      } else {
+        const count = cleanNumber(choice.fixedVisit.count, 1, 999, `${where}.fixedVisit.count`, errors, { int: true });
+        let sceneId = '';
+        if (typeof choice.fixedVisit.sceneId === 'string' && SCENE_ID_PATTERN.test(choice.fixedVisit.sceneId)) {
+          sceneId = choice.fixedVisit.sceneId;
+        } else {
+          errors.push(`${where}.fixedVisit.sceneId: 올바른 장면 키여야 합니다.`);
+        }
+        if (count !== null && sceneId) fixedVisit = { count, sceneId };
+      }
+    }
+
     if (choice.hideWhenLocked !== undefined && typeof choice.hideWhenLocked !== 'boolean') {
       errors.push(`${where}.hideWhenLocked: true/false여야 합니다.`);
     }
     return {
       label: cleanText(choice.label ?? '', LIMITS.CHOICE_LABEL, `${where}.label`, errors),
       to,
+      ...(fixedVisit ? { fixedVisit } : {}),
       condition: cleanList(choice.condition, MAX.ENTRIES, `${where}.condition`, errors, cleanCondition),
       effects: cleanList(choice.effects, MAX.ENTRIES, `${where}.effects`, errors, cleanEffect),
       hideWhenLocked: choice.hideWhenLocked === true,
