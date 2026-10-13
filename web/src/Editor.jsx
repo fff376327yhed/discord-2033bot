@@ -1051,6 +1051,22 @@ function hasProblem(scene, scenes) {
   return choices.some((c) => choiceBroken(c, scenes));
 }
 
+// 서버가 400으로 주는 "field: 메시지" 형식의 유효성 오류를,
+// 유저가 바로 이해할 수 있는 한국어 문장으로 바꿔준다.
+const VALIDATION_FIELD_LABELS = { title: '제목', description: '설명', tags: '태그' };
+function friendlyValidationMessage(details) {
+  if (!Array.isArray(details) || details.length === 0) return '입력값을 다시 확인해 주세요.';
+  return details
+    .map((d) => {
+      const i = d.indexOf(':');
+      if (i === -1) return d;
+      const field = d.slice(0, i).trim();
+      const msg = d.slice(i + 1).trim();
+      return `${VALIDATION_FIELD_LABELS[field] ?? field}이(가) ${msg}`;
+    })
+    .join(' / ');
+}
+
 // 사이드바 한 줄: scene 객체 레퍼런스가 안 바뀌면(= 다른 장면을 편집 중이면) 리렌더 스킵
 const ScenePageButton = memo(function ScenePageButton({ sceneKey, scene, pageNo, isStart, isCurrent, hasIssue, isOrphan, onSelect }) {
   return (
@@ -1409,6 +1425,14 @@ export default function Editor({ storyId, onBack }) {
     if (savingRef.current) return false;
     if (auto && !isDirty()) return true;
     const snap = latestRef.current; // 저장하는 동안 편집이 이어져도 "보낸 내용"을 기준으로 삼는다
+
+    // 제목이 비어 있으면 서버까지 가기 전에 먼저 알려준다 (가장 흔한 저장 실패 원인).
+    if (!snap.meta.title.trim()) {
+      setSaveMsg(auto ? '⚠️ 제목이 비어 있어 자동 저장을 건너뛰었어요.' : '⚠️ 제목을 입력해 주세요. (스토리 설정에서 입력)');
+      if (!auto) setPanel('settings');
+      return false;
+    }
+
     savingRef.current = true;
     if (!auto) { setSaving(true); setSaveMsg(null); }
     try {
@@ -1436,6 +1460,10 @@ export default function Editor({ storyId, onBack }) {
       } else if (err.status === 422) {
         setValidation(err.validation);
         setSaveMsg('공개 중인 스토리는 오류가 없어야 저장됩니다. 비공개로 바꾼 뒤 다시 시도하세요.');
+      } else if (err.status === 400) {
+        // 서버 쪽 유효성 검사 실패 (예: 제목 50자 초과, 태그 형식 오류 등) — 원인을 설정 화면과 함께 보여준다.
+        setSaveMsg(`${auto ? '자동 저장 실패: ' : ''}⚠️ ${friendlyValidationMessage(err.details)}`);
+        if (!auto) setPanel('settings');
       } else {
         setSaveMsg(`${auto ? '자동 ' : ''}저장 실패: ${err.message}`);
       }
