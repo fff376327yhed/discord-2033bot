@@ -2990,6 +2990,24 @@ export function createWebRouter({
     next();
   });
 
+  // 로그인 안 한 접속(IP) 임시 차단. 계정이 없는 공격자는 유저 차단이 안 되므로 IP 로 30분만 막는다. (src/activity.js)
+  //  - 서명이 맞는 로그인 쿠키가 있으면 통과: 같은 와이파이의 로그인한 사람들은 영향이 없다.
+  //  - 로그인/확인/로그아웃 주소는 통과: 막힌 IP 의 정상 유저도 로그인해서 빠져나올 수 있다.
+  //  - 막힌 요청은 보안 로그/점수에 다시 세지 않는다. (아래 auditMiddleware 보다 먼저 응답)
+  //  - 기록소(Firestore) 오류 시에는 막지 않는다. 운영자는 환경 변수 IP_BLOCK=off 로 끌 수 있다.
+  const IP_BLOCK_EXEMPT = new Set(['/api/auth/login', '/api/auth/callback', '/api/auth/me', '/api/auth/logout']);
+  router.use('/api', async (req, res, next) => {
+    try {
+      const url = String(req.originalUrl ?? req.url ?? '').split('?')[0];
+      if (!IP_BLOCK_EXEMPT.has(url) && !readPayload(req) && (await activity.isIpBlocked(req))) {
+        return res.status(403).json({ error: '비정상적인 요청이 많이 감지되어 이 접속이 잠시 제한되었습니다. 잠시 후 다시 시도하거나, 디스코드로 로그인해 주세요.' });
+      }
+    } catch (err) {
+      console.error('[ip-block] 확인 실패 (차단하지 않고 통과)', err?.message ?? err);
+    }
+    next();
+  });
+
   // 활동 로그/보안 로그: 응답이 끝나기 직전에 기록한다. (src/activity.js)
   // 아래 CSRF 검사보다 먼저 두어야 "막힌 요청(403)"도 보안 로그에 남는다.
   router.use('/api', activity.auditMiddleware());
@@ -3087,7 +3105,7 @@ export function createWebRouter({
       if (error) return res.redirect(302, '/?login=cancelled'); // 사용자가 취소
       // state 불일치 = 내가 시작하지 않은 로그인 (CSRF 의심)
       if (typeof code !== 'string' || typeof state !== 'string' || !saved || !safeEqual(state, saved)) {
-        await activity.logSecurity('security.auth_state', {}, req); // 내가 시작하지 않은 로그인 (가짜 로그인 링크 의심)
+        await activity.logSecurity('security.auth_state', {}, req, { weight: 5 }); // 내가 시작하지 않은 로그인 (가짜 로그인 링크 의심). 5점은 IP 차단 점수용
         return res.redirect(302, '/?login=failed');
       }
 

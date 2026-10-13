@@ -70,6 +70,8 @@ export const api = {
   adminSecurityEvents: (cursor) => request(`/admin/security-events${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
   adminRevokeUser: (id) => request(`/admin/users/${encodeURIComponent(id)}/revoke`, { method: 'POST', body: {} }),
   adminClearFlag: (id) => request(`/admin/users/${encodeURIComponent(id)}/clear-flag`, { method: 'POST', body: {} }),
+  adminIpBlocks: () => request('/admin/ip-blocks'),
+  adminUnblockIp: (ipHash) => request(`/admin/ip-blocks/${encodeURIComponent(ipHash)}/unblock`, { method: 'POST', body: {} }),
 };
 
 /** 디스코드 아바타 주소. 아바타가 없으면 디스코드 기본 아바타를 쓴다. */

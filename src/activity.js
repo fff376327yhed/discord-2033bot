@@ -38,6 +38,15 @@ export const ACTIVITY = {
   SUSPICIOUS_FLAG_SCORE: 5,        // 이 점수가 되면 🚩 의심 표시
   SUSPICIOUS_BLOCK_SCORE: 10,      // 이 점수가 되면 자동 차단 (운영자는 제외, 환경 변수 AUTO_BLOCK=off 로 끌 수 있음)
   SUSPICIOUS_WINDOW_MS: 10 * 60_000,
+  // 로그인 안 한 공격자(계정이 없어서 유저 차단이 안 되는 경우)는 IP 를 "임시로" 막는다.
+  //  - 같은 와이파이 사용자가 휘말리지 않도록 점수 기준을 높게(15점) 잡고, 30분 뒤 자동으로 풀린다.
+  //  - 로그인한 사람(서명이 맞는 쿠키)은 이 차단에 걸리지 않는다. (유저 단위 차단이 따로 있다)
+  //  - 환경 변수 IP_BLOCK=off 로 끌 수 있다.
+  IP_BLOCK_COL: 'ipBlocks',        // 최상위 컬렉션. 문서 ID = IP 해시
+  IP_BLOCK_SCORE: 15,              // 비로그인 요청의 의심 점수가 10분 안에 이만큼 쌓이면 차단
+  IP_BLOCK_MS: 30 * 60_000,        // 차단 시간
+  IP_CHECK_CACHE_MS: 30_000,       // 차단 여부 조회 결과를 서버 메모리에 기억하는 시간 (Firestore 읽기 절약)
+  IP_BLOCK_LIST_MAX: 50,           // 운영자 화면에 보여줄 차단 목록 개수
   MAX_META_KEYS: 6,
   MAX_META_LEN: 100,
   CACHE_MAX: 3000,                 // 메모리에 기억해 둘 항목 수 상한 (메모리 폭주 방지)
@@ -138,6 +147,7 @@ const ROUTE_LABELS = {
   'POST /api/admin/upload-stats/resync': ['admin.resync', '저장소 합계 다시 계산'],
   'POST /api/validate': null,        // 검사만 하는 요청이라 기록하지 않음
   'POST /api/auth/logout': null,     // 로그아웃은 라우트 안에서 직접 기록한다
+  'POST /api/admin/ip-blocks/:ipHash/unblock': ['admin.ip_unblock', 'IP 차단 해제'],
 };
 
 // 종류 → 이름 (직접 기록하는 것들)
@@ -153,6 +163,8 @@ const LABEL_BY_TYPE = {
   'security.auth_state': '로그인 확인값 불일치 (가짜 로그인 의심)',
   'security.auto_flag': '자동 의심 표시',
   'security.auto_block': '자동 차단 (해킹 시도 의심)',
+  'security.ip_block': '로그인 안 한 접속(IP) 임시 차단',
+  'security.ip_unblock': '접속(IP) 차단 해제 (운영자)',
 };
 
 // 같은 요청이 연달아 오면 한 번만 기록할 종류 (저장 버튼 한 번에 요청이 두 개 가는 경우 등)
@@ -171,8 +183,11 @@ export function createActivityLogger({ getDb, isAdminId = () => false, COL = { U
   const dupAt = new Map();     // 중복 방지 키 → 시각
   const secAt = new Map();     // 보안 이벤트 도배 방지 키 → 시각
   const flagWindow = new Map(); // userId → 최근 수상한 요청 시각들
+  const ipWindow = new Map();   // IP 해시 → 최근 수상한 (로그인 안 한) 요청 시각들
+  const ipBlockCache = new Map(); // IP 해시 → { until, checkedAt } (차단 여부 조회 결과 기억)
 
   const enabled = () => process.env.ACTIVITY_LOG !== 'off'; // 급할 때 끄는 스위치
+  const ipEnabled = () => enabled() && process.env.IP_BLOCK !== 'off'; // IP 임시 차단만 따로 끄는 스위치
   const remember = (map, key, value) => {
     if (map.size >= ACTIVITY.CACHE_MAX) map.clear(); // 가득 차면 통째로 비운다 (단순하고 안전)
     map.set(key, value);
@@ -225,6 +240,8 @@ export function createActivityLogger({ getDb, isAdminId = () => false, COL = { U
 
       // 의심 표시용 횟수는 도배 방지(아래 throttle)보다 먼저 센다. 도배하는 사람일수록 빨리 걸려야 하니까.
       if (uid && weight > 0) await noteSuspicious(uid, type, t, weight);
+      // 계정이 없는 (로그인 안 한) 요청은 유저 대신 IP 로 점수를 센다.
+      else if (!uid && weight > 0 && who.ipHash) await noteSuspiciousIp(who, type, t, weight);
 
       const key = `${who.ipHash || '-'}:${type}:${uid ?? ''}`;
       if (t - (secAt.get(key) ?? 0) < ACTIVITY.SECURITY_THROTTLE_MS) return false;
@@ -283,6 +300,63 @@ export function createActivityLogger({ getDb, isAdminId = () => false, COL = { U
     });
   }
 
+  // 로그인 안 한 요청의 의심 점수를 IP 별로 더한다. 15점이 되면 30분 동안 그 IP 의 "비로그인" 요청을 막는다.
+  // (서버리스라 점수는 서버 인스턴스마다 따로 센다. 한 곳에 몰리는 공격이면 충분히 걸리고, 대규모 공격은 Vercel Firewall 이 맡는다.)
+  async function noteSuspiciousIp(who, type, t, weight) {
+    if (!ipEnabled()) return;
+    const h = who.ipHash;
+    const list = (ipWindow.get(h) ?? []).filter((x) => t - x.t < ACTIVITY.SUSPICIOUS_WINDOW_MS);
+    const before = list.reduce((sum, x) => sum + x.w, 0);
+    list.push({ t, w: weight });
+    remember(ipWindow, h, list);
+    const after = before + weight;
+    if (!(before < ACTIVITY.IP_BLOCK_SCORE && after >= ACTIVITY.IP_BLOCK_SCORE)) return;
+    await blockIp(who, type, t, after);
+  }
+
+  async function blockIp(who, type, t, score) {
+    const until = t + ACTIVITY.IP_BLOCK_MS;
+    const reason = clean(LABEL_BY_TYPE[type] ?? type, 60);
+    remember(ipBlockCache, who.ipHash, { until, checkedAt: t });
+    await getDb().collection(ACTIVITY.IP_BLOCK_COL).doc(who.ipHash).set({
+      blockedAt: t,
+      until,
+      ip: who.ip,
+      reason,
+      score,
+      expireAt: new Date(until + 24 * 3_600_000), // TTL 정책을 켜 두면 풀린 뒤 하루 있다가 자동 삭제
+    });
+    await getDb().collection(ACTIVITY.SECURITY_COL).doc(newLogId(t)).set({
+      ts: t,
+      type: 'security.ip_block',
+      label: LABEL_BY_TYPE['security.ip_block'],
+      userId: null,
+      status: 0,
+      ...who,
+      meta: cleanMeta({ trigger: type, score, minutes: Math.round(ACTIVITY.IP_BLOCK_MS / 60_000) }),
+      expireAt: new Date(t + ACTIVITY.SECURITY_RETENTION_DAYS * 86_400_000),
+    });
+  }
+
+  /** 이 요청의 IP 가 지금 차단 중인가. 조회 실패 시에는 막지 않는다. (기록소 장애로 사이트 전체가 막히는 것 방지) */
+  async function isIpBlocked(req) {
+    if (!ipEnabled()) return false;
+    try {
+      const h = hashIp(clientIp(req));
+      if (!h) return false;
+      const t = now();
+      const hit = ipBlockCache.get(h);
+      if (hit && t - hit.checkedAt < ACTIVITY.IP_CHECK_CACHE_MS) return hit.until > t;
+      const snap = await getDb().collection(ACTIVITY.IP_BLOCK_COL).doc(h).get();
+      const until = snap.exists ? Number(snap.get('until')) || 0 : 0;
+      remember(ipBlockCache, h, { until, checkedAt: t });
+      return until > t;
+    } catch (err) {
+      reportError(err);
+      return false;
+    }
+  }
+
   /** "마지막 접속" 시각 갱신. 같은 서버에서는 10분에 한 번만 쓴다. */
   async function touchSeen(userId) {
     if (!enabled() || !ID_PATTERN.test(String(userId))) return;
@@ -315,7 +389,8 @@ export function createActivityLogger({ getDb, isAdminId = () => false, COL = { U
       // note 가 있는 403 = 우리 코드가 "가짜 출처/헤더 없음"으로 막은 것. (업로드 용량 초과 같은 정상적인 403 은 기록하지 않는다)
       jobs.push(logSecurity('security.forbidden', { path: shownPath, reason: note }, req, { userId: user?.id, status, weight: 5 }));
     } else if (status === 401 && method !== 'GET' && method !== 'HEAD') {
-      jobs.push(logSecurity('security.unauthorized', { path: shownPath }, req, { status }));
+      // 로그인 안 한 쓰기 시도: 세션이 만료된 정상 유저도 겪을 수 있어서 1점만 준다. (IP 차단 점수용)
+      jobs.push(logSecurity('security.unauthorized', { path: shownPath }, req, { status, weight: 1 }));
     } else if (status === 404 && url.startsWith('/api/admin') && user && !isAdminId(user.id)) {
       jobs.push(logSecurity('security.admin_probe', { path: clean(url, 80) }, req, { userId: user.id, status, weight: 5 }));
     }
@@ -399,7 +474,7 @@ export function createActivityLogger({ getDb, isAdminId = () => false, COL = { U
     };
   }
 
-  return { log, logSecurity, touchSeen, auditMiddleware };
+  return { log, logSecurity, touchSeen, auditMiddleware, isIpBlocked };
 }
 
 /** 아무것도 기록하지 않는 가짜 기록기 (테스트용) */
@@ -409,6 +484,7 @@ export function createNoopActivityLogger() {
     logSecurity: async () => false,
     touchSeen: async () => {},
     auditMiddleware: () => (req, res, next) => next(),
+    isIpBlocked: async () => false,
   };
 }
 
@@ -630,6 +706,42 @@ export function registerAdminUserRoutes({ router, requireAdmin, writeLimiter, ge
         items: items.map((i) => ({ ...i, user: i.userId ? profiles[i.userId] ?? { id: i.userId, username: null, avatar: null } : null })),
         nextCursor: snap.docs.length > limit ? String(page[page.length - 1].get('ts')) : null,
       });
+    })
+  );
+
+  // 로그인 안 한 접속(IP)의 임시 차단 목록. 아직 안 풀린 것만 보여준다. (IP 는 마지막 자리를 가린 값)
+  router.get(
+    '/api/admin/ip-blocks',
+    requireAdmin,
+    readLimiter,
+    wrap(async (req, res) => {
+      const t = Date.now();
+      const snap = await getDb().collection(ACTIVITY.IP_BLOCK_COL).where('until', '>', t).orderBy('until', 'desc').limit(ACTIVITY.IP_BLOCK_LIST_MAX).get();
+      res.json({
+        items: snap.docs.map((d) => ({
+          ipHash: d.id,
+          ip: clean(d.get('ip'), 64),
+          reason: clean(d.get('reason'), 60),
+          score: Number(d.get('score')) || 0,
+          blockedAt: Number(d.get('blockedAt')) || 0,
+          until: Number(d.get('until')) || 0,
+        })),
+      });
+    })
+  );
+
+  // 차단을 미리 푼다. (같은 와이파이 사용자가 잘못 걸렸을 때)
+  router.post(
+    '/api/admin/ip-blocks/:ipHash/unblock',
+    requireAdmin,
+    writeLimiter,
+    wrap(async (req, res) => {
+      const h = String(req.params.ipHash ?? '');
+      if (!/^[0-9a-f]{12}$/.test(h)) throw new HttpError(400, '올바르지 않은 IP 값입니다.');
+      const ref = getDb().collection(ACTIVITY.IP_BLOCK_COL).doc(h);
+      if (!(await ref.get()).exists) throw new HttpError(404, '차단 기록을 찾을 수 없습니다.');
+      await ref.set({ until: 0 }, { merge: true }); // 지우지 않고 해제 처리 (목록에서는 사라진다)
+      res.json({ ok: true });
     })
   );
 

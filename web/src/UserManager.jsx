@@ -395,11 +395,33 @@ export function SecurityLog() {
     }
   }, []);
 
+  // 로그인 안 한 접속(IP)의 임시 차단 목록
+  const [blocks, setBlocks] = useState([]);
+  const [blockError, setBlockError] = useState(null);
+  const loadBlocks = useCallback(async () => {
+    try {
+      const data = await api.adminIpBlocks();
+      if (alive.current) { setBlocks(data.items); setBlockError(null); }
+    } catch (err) {
+      if (alive.current) setBlockError(err.message);
+    }
+  }, []);
+  async function unblock(b) {
+    if (!window.confirm(`${b.ip || '이 접속'}의 임시 차단을 지금 풀까요?`)) return;
+    try {
+      await api.adminUnblockIp(b.ipHash);
+      await loadBlocks();
+    } catch (err) {
+      setBlockError(err.message);
+    }
+  }
+
   useEffect(() => {
     alive.current = true;
     load(null);
+    loadBlocks();
     return () => { alive.current = false; };
-  }, [load]);
+  }, [load, loadBlocks]);
 
   return (
     <div className="um-wrap">
@@ -407,8 +429,28 @@ export function SecurityLog() {
         로그인 확인값 불일치, 차단된 요청(403), 속도 제한(429), 로그인 없는 쓰기 시도, 운영자 주소에 접근한 일반 유저가 기록됩니다.
         의심 점수가 10분 안에 5점이 되면 🚩 의심 표시, 10점이 되면 자동 차단됩니다. (가짜 출처 요청·운영자 주소 접근 = 5점, 속도 제한 = 1점. 운영자는 차단되지 않음)
         잘못 차단됐다면 "전체 유저"에서 해당 유저를 열어 차단 해제하세요.
+        로그인 안 한 접속은 계정이 없으므로 IP 로 막습니다: 10분 안에 15점이 쌓이면 30분 동안 로그인 없는 요청만 제한되고(로그인한 사람은 영향 없음), 아래 목록에서 바로 풀 수 있습니다.
       </div>
-      <div><button type="button" className="btn btn-small" disabled={loading} onClick={() => load(null)}>새로고침</button></div>
+
+      {blockError && <div>⚠️ {blockError}</div>}
+      {blocks.length > 0 && (
+        <div className="card soft">
+          <strong>🚫 임시 차단 중인 접속 (로그인 안 한 사람)</strong>
+          {blocks.map((b) => (
+            <div key={b.ipHash} className="um-log-row sec">
+              <div className="um-log-main">
+                <span className="um-log-label">{b.ip || b.ipHash}</span>
+                <span className="muted"> {b.reason} · {b.score}점</span>
+              </div>
+              <div className="um-log-sub">
+                {fmt(b.blockedAt)} 차단 · {fmt(b.until)} 에 자동으로 풀림{' '}
+                <button type="button" className="btn btn-small" onClick={() => unblock(b)}>지금 풀기</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <div><button type="button" className="btn btn-small" disabled={loading} onClick={() => { load(null); loadBlocks(); }}>새로고침</button></div>
 
       {error && <div>⚠️ {error}</div>}
       {!error && !items && <div>불러오는 중...</div>}
