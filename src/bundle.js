@@ -1034,13 +1034,14 @@ const EMPTY_ICON = '🖤';
 const FILLED_ICON = '🟩';
 const NUMBER_ICONS = { money: '🪙', coin: '🪙', gold: '🪙' };
 
-// ★ 본문 맨 위에 "기본으로" 보여줄 3가지 (체력 / 멘탈 / 돈). 나머지(정신력·탄약·식량 등)는 📊 상세에서만 보인다.
-//   keys   = 스토리 설정의 능력치 키 이름,  labels = 화면에 표시되는 이름 (둘 중 하나만 맞아도 표시)
-//   바꾸고 싶으면 여기 목록만 고치면 된다. (예: 정신력도 위에 띄우려면 mental 의 keys 에 'sanity' 추가)
+// ★ 본문 맨 위에 "기본으로" 보여줄 3가지 (체력 / 멘탈 / 돈). 나머지(탄약·식량 등)는 📊 상세에서만 보인다.
+//   keys   = 스토리 설정의 능력치 키 이름 (대소문자 무시, 정확히 일치)
+//   words  = 화면 이름(label)에 이 글자가 "포함"되면 해당 (예: '정신' → 정신력, 정신 수치)
+//   바꾸고 싶으면 여기 목록만 고치면 된다.
 const TOP_STATUS = [
-  { keys: ['hp', 'health'], labels: ['체력'], icon: '❤️' },
-  { keys: ['mental', 'mind'], labels: ['멘탈'], icon: '🧠' },
-  { keys: ['money', 'coin', 'gold'], labels: ['돈', '골드', '코인'], icon: '🪙' },
+  { keys: ['hp', 'health'], words: ['체력', 'hp'], icon: '❤️' },
+  { keys: ['mental', 'mind', 'sanity', 'san'], words: ['멘탈', '정신', 'mental', 'sanity'], icon: '🧠' },
+  { keys: ['money', 'coin', 'gold', 'cash'], words: ['돈', '골드', '코인', '소지금', '금액', 'money', 'gold'], icon: '🪙' },
 ];
 
 // 능력치의 최소/최대 (설정에 없으면 엔진 기본 범위)
@@ -1060,7 +1061,10 @@ function barText(value, min, max, onIcon) {
 function findTopEntry(config, spec) {
   for (const bucket of ['stats', 'resources']) {
     for (const [key, def] of Object.entries(config?.[bucket] ?? {})) {
-      if (spec.keys.includes(key) || spec.labels.includes(def?.label)) return { bucket, key, def };
+      const label = String(def?.label ?? '').toLowerCase();
+      if (spec.keys.includes(key.toLowerCase()) || spec.words.some((word) => label.includes(word))) {
+        return { bucket, key, def };
+      }
     }
   }
   return null;
