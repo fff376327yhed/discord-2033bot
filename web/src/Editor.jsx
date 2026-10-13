@@ -1436,7 +1436,11 @@ export default function Editor({ storyId, onBack }) {
     savingRef.current = true;
     if (!auto) { setSaving(true); setSaveMsg(null); }
     try {
-      await api.updateStory(storyId, { title: snap.meta.title, description: snap.meta.description, tags: snap.meta.tags, baseUpdatedAt: baseRef.current });
+      // 제목/설명/태그를 저장하면 서버가 "수정 시각"을 새로 적는다.
+      // 그 새 시각을 받아서 두 번째 요청(장면 저장)에 써야 409(충돌)이 나지 않는다.
+      const metaResult = await api.updateStory(storyId, { title: snap.meta.title, description: snap.meta.description, tags: snap.meta.tags, baseUpdatedAt: baseRef.current });
+      baseRef.current = metaResult.updatedAt;
+      setBaseUpdatedAt(metaResult.updatedAt);
       const scenesToSend = {};
       for (const [key, scene] of Object.entries(snap.scenes)) {
         const { id, ...rest } = scene;
