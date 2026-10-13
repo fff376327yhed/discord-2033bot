@@ -10,6 +10,7 @@ import rateLimit from 'express-rate-limit';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { registerUploadRoutes } from './uploads.js';
+import { createActivityLogger, createNoopActivityLogger, registerAdminUserRoutes, isAllowedOrigin } from './activity.js'; // 활동 로그 / 보안 이벤트 / 운영자 유저 관리
 
 // ═════════════════════════════════════════════
 // lib/collections: 컬렉션 이름, 제한값, ID 규칙
@@ -2863,6 +2864,7 @@ export function createFirestoreSessionStore() {
     return { validAfter, blocked, at: now };
   }
   return {
+    usesFirestore: true, // 활동 로그가 진짜 Firestore 를 쓸지 정하는 표시 (테스트의 메모리 저장소에는 없다)
     async getValidAfter(userId, now = Date.now()) { return (await load(userId, now)).validAfter; },
     async isBlocked(userId, now = Date.now()) { return (await load(userId, now)).blocked; },
     async revoke(userId, now = Date.now()) {
@@ -2962,6 +2964,8 @@ export function createWebRouter({
   sessionStore = createFirestoreSessionStore(),
   rateLimitBackend = createFirestoreRateLimitBackend(),
   cleanupRunner = (options) => runCleanup(getDb(), options),
+  // 진짜 Firestore 저장소를 쓸 때만 기록한다. 테스트처럼 메모리 저장소를 넘기면 아무것도 기록하지 않는다. (테스트가 진짜 DB에 쓰는 사고 방지)
+  activity = sessionStore.usesFirestore ? createActivityLogger({ getDb, isAdminId, COL }) : createNoopActivityLogger(),
 } = {}) {
   const router = express.Router();
 
@@ -2986,12 +2990,22 @@ export function createWebRouter({
     next();
   });
 
+  // 활동 로그/보안 로그: 응답이 끝나기 직전에 기록한다. (src/activity.js)
+  // 아래 CSRF 검사보다 먼저 두어야 "막힌 요청(403)"도 보안 로그에 남는다.
+  router.use('/api', activity.auditMiddleware());
+
   // CSRF 2차 방어: 글을 바꾸는 요청(POST/PUT/PATCH/DELETE)에는 직접 만든 헤더가 있어야 한다.
   // 다른 사이트의 폼/이미지는 이 헤더를 붙일 수 없고, fetch로 붙이려면 CORS 사전 확인을 통과해야 하는데
   // 이 서버는 CORS를 허용하지 않으므로 막힌다. (쿠키의 SameSite=Lax 와 함께 이중 방어)
   router.use('/api', (req, res, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
     if (req.get(WEB.CSRF_HEADER) !== WEB.CSRF_VALUE) {
+      res.locals.auditNote = 'csrf_header'; // 보안 로그에 이유를 남기기 위한 메모
+      return res.status(403).json({ error: '잘못된 요청입니다.' });
+    }
+    // 3번째 방어선: 요청을 보낸 사이트 주소(Origin)가 우리 사이트인지 확인한다.
+    if (!isAllowedOrigin(req)) {
+      res.locals.auditNote = 'bad_origin';
       return res.status(403).json({ error: '잘못된 요청입니다.' });
     }
     next();
@@ -3073,6 +3087,7 @@ export function createWebRouter({
       if (error) return res.redirect(302, '/?login=cancelled'); // 사용자가 취소
       // state 불일치 = 내가 시작하지 않은 로그인 (CSRF 의심)
       if (typeof code !== 'string' || typeof state !== 'string' || !saved || !safeEqual(state, saved)) {
+        await activity.logSecurity('security.auth_state', {}, req); // 내가 시작하지 않은 로그인 (가짜 로그인 링크 의심)
         return res.redirect(302, '/?login=failed');
       }
 
@@ -3110,12 +3125,24 @@ export function createWebRouter({
       // users/{ID} 저장 (처음이면 createdAt 기록). 디스코드 액세스 토큰은 저장하지 않는다.
       const userRef = getDb().collection(COL.USERS).doc(user.id);
       const existing = await userRef.get();
-      if (existing.get('blocked') === true) return res.redirect(302, '/?login=blocked'); // 7-4: 차단된 계정은 로그인 쿠키를 주지 않는다
+      if (existing.get('blocked') === true) {
+        await activity.log(user.id, 'auth.login_blocked', {}, req, { ok: false }); // 7-4: 차단된 계정은 로그인 쿠키를 주지 않는다
+        return res.redirect(302, '/?login=blocked');
+      }
       const now = Date.now();
       await userRef.set(
-        { username: user.username, avatar: user.avatar, updatedAt: now, ...(existing.exists ? {} : { createdAt: now }) },
+        {
+          username: user.username,
+          avatar: user.avatar,
+          updatedAt: now,
+          lastLoginAt: now,
+          lastSeenAt: now,
+          loginCount: FieldValue.increment(1), // 운영자 화면의 "로그인 N회"
+          ...(existing.exists ? {} : { createdAt: now }),
+        },
         { merge: true }
       );
+      await activity.log(user.id, 'auth.login', { firstTime: !existing.exists }, req);
 
       const jwt = signJwt({ sub: user.id, name: user.username, avatar: user.avatar });
       res.cookie(WEB.SESSION_COOKIE, jwt, { ...cookieBase(), maxAge: WEB.SESSION_DAYS * 86400 * 1000, path: '/' });
@@ -3125,7 +3152,8 @@ export function createWebRouter({
 
   // 지금 로그인한 사람 (로그인 안 했으면 user: null)
   // isAdmin 은 화면에서 운영 메뉴를 보일지 정하는 용도일 뿐이다. 진짜 권한 확인은 서버의 requireAdmin 이 한다. (7-4)
-  router.get('/api/auth/me', optionalAuth, (req, res) => {
+  router.get('/api/auth/me', optionalAuth, async (req, res) => {
+    if (req.user) await activity.touchSeen(req.user.id); // 마지막 접속 시각 (같은 서버에서 10분에 한 번만 쓰고, 실패해도 무시)
     res.json({ user: req.user, isAdmin: req.user ? isAdminId(req.user.id) : false });
   });
 
@@ -3136,6 +3164,7 @@ export function createWebRouter({
     const payload = readPayload(req);
     let revoked = false;
     if (payload) {
+      await activity.log(String(payload.sub), 'auth.logout', {}, req);
       try {
         await sessionStore.revoke(String(payload.sub));
         revoked = true;
@@ -3820,6 +3849,9 @@ export function createWebRouter({
       res.json({ users });
     })
   );
+
+  // 운영자 전용: 전체 유저 목록/상세, 유저별 활동 로그, 보안 로그, 강제 로그아웃 (src/activity.js)
+  registerAdminUserRoutes({ router, requireAdmin, writeLimiter, getDb, isAdminId, HttpError, wrap, sessionStore, COL });
 
   // 사진 업로드 (Vercel Blob). 일반 유저는 제한, 운영자는 무제한 + 사용량 보기
   registerUploadRoutes({ router, requireAuth, requireAdmin, writeLimiter, getDb, isAdminId, HttpError, wrap, FieldValue });

@@ -1,0 +1,39 @@
+/* 관리자 "전체 유저" / "보안 로그" 화면 전용 스타일 (기존 styles.css 의 변수를 그대로 쓴다) */
+.um-wrap { display: flex; flex-direction: column; gap: 10px; }
+.um-avatar { border-radius: 50%; display: block; flex: 0 0 auto; background: var(--panel2); }
+
+.um-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; }
+.um-stat { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 10px 12px; }
+.um-stat-n { font-size: 22px; font-weight: 800; }
+.um-stat-l { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+.um-controls { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.um-controls input { flex: 1; min-width: 160px; }
+
+.um-row { cursor: pointer; }
+.um-row.selected { border-color: var(--accent); background: var(--accent-soft); }
+.um-row-main { display: flex; gap: 10px; align-items: center; min-width: 0; width: 100%; }
+.um-name { overflow-wrap: anywhere; }
+
+.badge.um-bad { background: var(--bad-bg); color: var(--bad-fg); }
+.badge.um-warn { background: var(--warn-bg); color: var(--warn-fg); }
+
+.um-detail { border-color: var(--accent); }
+.um-detail-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.um-detail-head .spacer { flex: 1; }
+.um-profile { display: flex; gap: 12px; align-items: flex-start; }
+.um-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.um-block-box { margin-top: 10px; padding: 10px 12px; border-radius: 12px; background: var(--bad-bg); color: var(--bad-fg); font-size: 13px; }
+.um-block-box input { background: var(--panel); color: var(--text); }
+
+.um-log { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.um-log-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.um-log-row { padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
+.um-log-row.fail, .um-log-row.sec { background: var(--warn-bg); border-color: transparent; color: var(--warn-fg); }
+.um-log-main { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.um-log-label { font-weight: 700; font-size: 14px; }
+.um-log-sub { margin-top: 3px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.um-log-row.fail .um-log-sub, .um-log-row.sec .um-log-sub { color: inherit; opacity: .8; }
+.um-log-sub .um-avatar { display: inline-block; vertical-align: middle; }
+.um-meta { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.um-chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--panel2); color: var(--muted); max-width: 100%; overflow-wrap: anywhere; }

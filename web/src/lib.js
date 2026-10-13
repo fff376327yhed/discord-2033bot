@@ -63,6 +63,13 @@ export const api = {
   adminStories: (authorId) => request(`/admin/stories${authorId ? `?authorId=${encodeURIComponent(authorId)}` : ''}`),
   adminHiddenStories: () => request('/admin/hidden-stories'),
   adminBlockedUsers: () => request('/admin/blocked-users'),
+  // 관리자: 전체 유저 / 유저 상세 / 유저별 활동 로그 / 보안 로그 / 강제 로그아웃 / 의심 표시 해제
+  adminUsers: (params) => request(`/admin/users?${params ?? ''}`),
+  adminUser: (id) => request(`/admin/users/${encodeURIComponent(id)}`),
+  adminUserActivity: (id, cursor) => request(`/admin/users/${encodeURIComponent(id)}/activity${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
+  adminSecurityEvents: (cursor) => request(`/admin/security-events${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
+  adminRevokeUser: (id) => request(`/admin/users/${encodeURIComponent(id)}/revoke`, { method: 'POST', body: {} }),
+  adminClearFlag: (id) => request(`/admin/users/${encodeURIComponent(id)}/clear-flag`, { method: 'POST', body: {} }),
 };
 
 /** 디스코드 아바타 주소. 아바타가 없으면 디스코드 기본 아바타를 쓴다. */

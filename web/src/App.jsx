@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { api, avatarUrl } from './lib.js';
 import Editor from './Editor.jsx';
 import StorageMonitor from './StorageMonitor.jsx';
+import UserManager, { SecurityLog } from './UserManager.jsx';
 
 /* ───────────────────────── Login ───────────────────────── */
 
@@ -82,6 +83,8 @@ const STATUS_LABELS = {
   stories: '전체 스토리',
   hidden: '숨긴 스토리',
   blocked: '차단한 사용자',
+  users: '전체 유저',
+  security: '보안 로그',
 };
 
 const fmt = (ms) => (ms ? new Date(ms).toLocaleString('ko-KR') : '-');
@@ -124,6 +127,11 @@ function AdminPanel({ onOpen }) {
   function reload() {
     setError(null);
     setReports(null);
+    // 전체 유저/보안 로그 탭은 아래의 별도 화면(UserManager/SecurityLog)이 직접 불러온다.
+    if (status === 'users' || status === 'security') {
+      setReports([]);
+      return;
+    }
     const request = status === 'stories'
       ? api.adminStories(authorId).then((data) => data.stories)
       : status === 'hidden'
@@ -269,6 +277,14 @@ function AdminPanel({ onOpen }) {
   }
 
   const isStoryTab = status === 'stories' || status === 'hidden';
+  const isUserTab = status === 'users' || status === 'security';
+
+  // 유저 상세의 "스토리 보기" → 전체 스토리 탭에서 그 작성자만 보여준다.
+  function showStoriesOf(userId) {
+    setAuthorInput(userId);
+    setAuthorId(userId);
+    setStatus('stories');
+  }
   const isReportTab = status === 'open' || status === 'resolved' || status === 'dismissed';
 
   return (
@@ -304,11 +320,14 @@ function AdminPanel({ onOpen }) {
 
       {error && <div>⚠️ {error}</div>}
       {!error && !reports && <div>불러오는 중...</div>}
-      {reports?.length === 0 && (
+      {!isUserTab && reports?.length === 0 && (
         <p style={{ color: 'var(--muted)' }}>
           {isStoryTab ? '스토리가 없습니다.' : status === 'blocked' ? '차단한 사용자가 없습니다.' : '신고가 없습니다.'}
         </p>
       )}
+
+      {status === 'users' && <UserManager onShowStories={showStoriesOf} />}
+      {status === 'security' && <SecurityLog />}
 
       {isStoryTab && reports?.map(renderStory)}
 
