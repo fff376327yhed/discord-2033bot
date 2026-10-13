@@ -571,7 +571,7 @@ function ChoiceCard({ choice, index, isFirst, isLast, scenes, order, pageOf, con
 
 /* ───────── 장면 전체 ───────── */
 
-function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, config, onChange, onDelete, onDuplicate, onSetStart, onGoto }) {
+function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, config, onChange, onDelete, onDuplicate, onSetStart, onRename, onGoto }) {
   const choices = scene.choices ?? [];
   const isStart = sceneKey === startSceneId;
 
@@ -598,6 +598,10 @@ function SceneForm({ sceneKey, scene, scenes, order, pageOf, startSceneId, confi
         {scene.isEnding && <span className="badge end">🏁 엔딩</span>}
         <span className="spacer" />
         {!isStart && <button type="button" className="btn btn-small" onClick={onSetStart}>🚩 시작 장면으로</button>}
+        <button
+          type="button" className="btn btn-small" title="키 이름 바꾸기 (이 장면을 가리키는 선택지도 같이 고쳐져요)"
+          onClick={() => { const next = prompt('새 키 이름 (영문/숫자/_/- 40자 이하)', sceneKey); if (next !== null) onRename(next); }}
+        >✏️ 이름 바꾸기</button>
         <button type="button" className="btn btn-small" onClick={onDuplicate} title="이 장면을 똑같이 복제">복제</button>
         <button type="button" className="btn btn-small btn-danger-outline" onClick={onDelete}>삭제</button>
       </div>
@@ -938,6 +942,45 @@ export default function Editor({ storyId, onBack }) {
     setSelected((cur) => (cur === key ? startSceneId : cur));
   }
 
+  function renameScene(oldKey, rawName) {
+    const newKey = String(rawName ?? '').trim();
+    if (!newKey || newKey === oldKey) return;
+    if (!/^[a-zA-Z0-9_-]{1,40}$/.test(newKey) || ['__proto__', 'constructor', 'prototype'].includes(newKey)) {
+      alert('영문/숫자/_/- 40자 이하만 가능합니다. (__proto__ 같은 예약어는 쓸 수 없어요)');
+      return;
+    }
+    if (scenes[newKey]) { alert(`'${newKey}' 는 이미 있는 장면 키입니다.`); return; }
+
+    setScenes((prev) => {
+      const next = {}; // 키 순서를 그대로 유지하려고 새로 쌓는다
+      for (const [k, s] of Object.entries(prev)) {
+        const list = s.choices ?? [];
+        const choices = list.map((c) => {
+          let out = c;
+          if (typeof c.to === 'string') {
+            if (c.to === oldKey) out = { ...out, to: newKey };
+          } else if (Array.isArray(c.to) && c.to.some((b) => b?.sceneId === oldKey)) {
+            out = { ...out, to: c.to.map((b) => (b?.sceneId === oldKey ? { ...b, sceneId: newKey } : b)) };
+          }
+          if (c.fixedVisit?.sceneId === oldKey) out = { ...out, fixedVisit: { ...c.fixedVisit, sceneId: newKey } };
+          return out;
+        });
+        const changed = choices.some((c, i) => c !== list[i]);
+        if (k === oldKey) next[newKey] = { ...s, id: newKey, choices };
+        else next[k] = changed ? { ...s, choices } : s; // 안 바뀐 장면은 그대로 둬서 불필요한 다시 그리기를 막는다
+      }
+      return next;
+    });
+    setConfig((prev) => {
+      const stats = prev.stats ?? {};
+      if (!Object.values(stats).some((d) => d?.onZero === oldKey)) return prev;
+      return { ...prev, stats: Object.fromEntries(Object.entries(stats).map(([k, d]) => [k, d?.onZero === oldKey ? { ...d, onZero: newKey } : d])) };
+    });
+    setStartSceneId((cur) => (cur === oldKey ? newKey : cur));
+    setSelected((cur) => (cur === oldKey ? newKey : cur));
+    setSaveMsg(`'${oldKey}' → '${newKey}' 로 바꿨어요.`);
+  }
+
   function isDirty() {
     const s = savedRef.current, n = latestRef.current;
     return Boolean(s) && (s.meta !== n.meta || s.config !== n.config || s.scenes !== n.scenes || s.startSceneId !== n.startSceneId);
@@ -1260,6 +1303,7 @@ export default function Editor({ storyId, onBack }) {
               onChange={(patch) => updateScene(current, patch)}
               onDelete={() => deleteScene(current)}
               onDuplicate={() => duplicateScene(current)}
+              onRename={(name) => renameScene(current, name)}
               onSetStart={() => setStartSceneId(current)}
               onGoto={selectScene}
             />
