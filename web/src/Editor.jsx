@@ -235,8 +235,8 @@ function BucketEditor({ title, bucket, config, setConfig, onRenameKey, onRemoveK
   function rename(key) {
     const next = (prompt(`'${key}' 의 새 키 이름 (영문/숫자/_/- 40자 이하)`, key) ?? '').trim();
     if (!next || next === key) return;
-    if (!/^[a-zA-Z0-9_-]{1,40}$/.test(next) || ['__proto__', 'constructor', 'prototype'].includes(next)) {
-      alert('영문/숫자/_/- 40자 이하만 가능합니다. (__proto__ 같은 예약어는 쓸 수 없어요)');
+    if (!/^[a-zA-Z0-9_가-힣-]{1,40}$/.test(next) || ['__proto__', 'constructor', 'prototype'].includes(next)) {
+      alert('영문/숫자/한글/_/- 40자 이하만 가능합니다. (__proto__ 같은 예약어는 쓸 수 없어요)');
       return;
     }
     if (config[bucket]?.[next]) { alert('이미 있는 키입니다.'); return; }
@@ -245,7 +245,7 @@ function BucketEditor({ title, bucket, config, setConfig, onRenameKey, onRemoveK
   function add() {
     const key = prompt(`새 ${title} 키 (영문/숫자/_/- , 예: hp)`);
     if (!key) return;
-    if (!/^[a-zA-Z0-9_-]{1,40}$/.test(key)) { alert('영문/숫자/_/- 40자 이하만 가능합니다.'); return; }
+    if (!/^[a-zA-Z0-9_가-힣-]{1,40}$/.test(key)) { alert('영문/숫자/한글/_/- 40자 이하만 가능합니다.'); return; }
     if (config[bucket]?.[key]) { alert('이미 있는 키입니다.'); return; }
     const def = numeric ? { label: key, initial: 0, min: 0, max: 100 } : { label: key };
     setConfig((prev) => ({ ...prev, [bucket]: { ...prev[bucket], [key]: def } }));

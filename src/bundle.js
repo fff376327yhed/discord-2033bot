@@ -2065,7 +2065,7 @@ export const WEB = {
 };
 
 // STORY_ID_PATTERN 은 bot/handlers 에서 선언한 것을 그대로 쓴다.
-const KEY_PATTERN = SCENE_ID_PATTERN;             // 스탯/아이템/플래그 키도 장면 키와 같은 규칙
+const KEY_PATTERN = /^[a-zA-Z0-9_가-힣-]{1,40}$/;  // 스탯/아이템/플래그 키: 영문/숫자/한글/_/- (장면 키는 SCENE_ID_PATTERN 그대로 영문만)
 const DISCORD_ID_PATTERN = /^\d{5,25}$/;
 
 // 입력 제한값 (디스코드 표시 제한과 Firestore 문서 크기를 고려한 값)
@@ -2282,7 +2282,7 @@ function cleanList(value, max, path, errors, cleaner) {
 function cleanCondition(cond, path, errors) {
   if (!isPlainObject(cond)) return void errors.push(`${path}: 객체여야 합니다.`);
   if (!ENTRY_TYPES.includes(cond.type)) return void errors.push(`${path}.type: ${ENTRY_TYPES.join('/')} 중 하나여야 합니다.`);
-  if (!isValidKey(cond.key)) return void errors.push(`${path}.key: 영문/숫자/_/- 40자 이하여야 합니다.`);
+  if (!isValidKey(cond.key)) return void errors.push(`${path}.key: 영문/숫자/한글/_/- 40자 이하여야 합니다.`);
 
   if (cond.type === 'flag') {
     if (cond.value !== undefined && typeof cond.value !== 'boolean') errors.push(`${path}.value: true/false여야 합니다.`);
@@ -2301,7 +2301,7 @@ function cleanCondition(cond, path, errors) {
 function cleanEffect(effect, path, errors) {
   if (!isPlainObject(effect)) return void errors.push(`${path}: 객체여야 합니다.`);
   if (!ENTRY_TYPES.includes(effect.type)) return void errors.push(`${path}.type: ${ENTRY_TYPES.join('/')} 중 하나여야 합니다.`);
-  if (!isValidKey(effect.key)) return void errors.push(`${path}.key: 영문/숫자/_/- 40자 이하여야 합니다.`);
+  if (!isValidKey(effect.key)) return void errors.push(`${path}.key: 영문/숫자/한글/_/- 40자 이하여야 합니다.`);
 
   if (effect.type === 'flag') {
     if (effect.value !== undefined && typeof effect.value !== 'boolean') errors.push(`${path}.value: true/false여야 합니다.`);
@@ -2338,7 +2338,7 @@ export function sanitizeConfig(input, errors, path = 'config') {
     for (const [key, def] of entries) {
       const where = `${path}.${bucket}.${String(key).slice(0, 40)}`;
       if (!isValidKey(key)) {
-        errors.push(`${where}: 키는 영문/숫자/_/- 40자 이하여야 합니다.`);
+        errors.push(`${where}: 키는 영문/숫자/한글/_/- 40자 이하여야 합니다.`);
         continue;
       }
       if (!isPlainObject(def)) {
@@ -2383,7 +2383,7 @@ export function sanitizeConfig(input, errors, path = 'config') {
     for (const [key, def] of entries) {
       const where = `${path}.${bucket}.${String(key).slice(0, 40)}`;
       if (!isValidKey(key)) {
-        errors.push(`${where}: 키는 영문/숫자/_/- 40자 이하여야 합니다.`);
+        errors.push(`${where}: 키는 영문/숫자/한글/_/- 40자 이하여야 합니다.`);
         continue;
       }
       const label = cleanText(isPlainObject(def) ? (def.label ?? key) : key, MAX.LABEL, `${where}.label`, errors, { required: true });
@@ -2525,7 +2525,7 @@ export function sanitizeScenes(input, errors, path = 'scenes') {
   }
   for (const [key, scene] of entries) {
     const where = `${path}.${String(key).slice(0, 40)}`;
-    if (!isValidKey(key)) {
+    if (typeof key !== 'string' || !isSafeKey(key) || !SCENE_ID_PATTERN.test(key)) { // 장면 키는 영문만 (스탯/아이템 키와 규칙이 다름)
       errors.push(`${where}: 장면 키는 영문/숫자/_/- 40자 이하여야 합니다.`);
       continue;
     }
